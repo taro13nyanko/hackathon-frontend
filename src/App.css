@@ -1,0 +1,67 @@
+/* 余白は 4/8/12/16/24/32px だけを使う（カリキュラム「デザイン」章の方針） */
+:root {
+  --accent: #e8473b;
+  --accent-ink: #fff;
+  --ink: #111;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --bg-soft: #f6f6f7;
+}
+
+.app { min-height: 100vh; display: flex; flex-direction: column; }
+.header {
+  position: sticky; top: 0; z-index: 1;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; background: #fff; border-bottom: 1px solid var(--line);
+}
+.logo { background: none; color: var(--accent); font-weight: 800; font-size: 1.25rem; padding: 4px 0; }
+main { width: 100%; max-width: 960px; margin: 0 auto; padding: 16px; box-sizing: border-box; flex: 1; }
+h1 { font-size: 1.4rem; margin: 16px 0 12px; }
+h2 { font-size: 1rem; margin: 24px 0 8px; }
+.api { color: var(--muted); font-size: 0.75rem; padding: 16px; text-align: center; word-break: break-all; }
+
+button { padding: 8px 16px; border: 0; border-radius: 8px; font-size: 1rem; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+.primary { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.ghost { background: none; color: var(--ink); border: 1px solid var(--line); }
+input, textarea {
+  width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px;
+  font: inherit; background: #fff;
+}
+.ok { color: #15803d; }
+.err { color: #b91c1c; }
+.muted { color: var(--muted); }
+
+/* 一覧 */
+.search { display: flex; gap: 8px; margin-bottom: 16px; }
+.search button { background: var(--ink); color: #fff; white-space: nowrap; }
+.grid { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+.card {
+  position: relative; width: 100%; padding: 0; text-align: left; background: #fff;
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden; color: var(--ink);
+}
+.card:hover { border-color: #cbd5e1; }
+.thumb {
+  aspect-ratio: 1; display: grid; place-items: center; background: var(--bg-soft);
+  font-size: 2.5rem; font-weight: 700; color: #c4c4c8;
+}
+.thumb.large { max-width: 360px; font-size: 5rem; border-radius: 8px; }
+.card-body { display: flex; flex-direction: column; gap: 4px; padding: 8px 12px 12px; }
+.title { font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.price { font-weight: 700; }
+.price.big { font-size: 1.6rem; margin: 0; }
+.sold {
+  position: absolute; top: 8px; left: 8px; padding: 4px 8px; border-radius: 4px;
+  background: var(--ink); color: #fff; font-size: 0.75rem; font-weight: 700;
+}
+
+/* 出品フォーム */
+.sell { display: flex; flex-direction: column; gap: 16px; max-width: 560px; }
+.sell label { display: flex; flex-direction: column; gap: 8px; font-weight: 600; }
+.sell small { color: var(--muted); font-weight: 400; }
+.actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* 詳細 */
+.detail { margin-top: 16px; max-width: 560px; }
+.status { color: var(--muted); margin: 4px 0 0; }
+.desc { white-space: pre-wrap; line-height: 1.7; }
