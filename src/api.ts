@@ -161,4 +161,53 @@ export async function listMyPurchases(): Promise<Purchase[]> {
   return res.json();
 }
 
+// ---- メッセージ（DM） ----
+
+export type Message = { id: string; sender_id: string; body: string; created_at: string };
+export type Conversation = { id: string; item: Item; partner: Member; last_message: Message | null };
+export const MESSAGE_MAX = 1000; // バックエンドの usecase/dm.go と同じ
+
+async function dmError(res: Response, fallback: string): Promise<ApiError> {
+  const code = await errorCode(res);
+  const messages: Record<string, string> = {
+    own_item: "自分が出品した商品です",
+    no_seller: "見本データの商品にはメッセージを送れません",
+    forbidden: "このやりとりは見られません",
+    not_found: "見つかりませんでした",
+    invalid_input: `メッセージは1〜${MESSAGE_MAX}文字で入力してください`,
+    unauthorized: "ログインし直してください",
+  };
+  return new ApiError(messages[code] ?? `${fallback} (HTTP ${res.status})`, res.status, code);
+}
+
+// startConversation はこの商品の出品者とのやりとりを始める（もうあれば、それを返す）。
+export async function startConversation(itemId: string): Promise<Conversation> {
+  const res = await authFetch(`/items/${encodeURIComponent(itemId)}/conversations`, { method: "POST" });
+  if (!res.ok) throw await dmError(res, "メッセージを始められませんでした");
+  return res.json();
+}
+
+export async function listConversations(): Promise<Conversation[]> {
+  const res = await authFetch("/conversations");
+  if (!res.ok) throw await dmError(res, "メッセージ一覧の取得に失敗しました");
+  return res.json();
+}
+
+// listMessages は after（メッセージ ID）より新しいメッセージを古い順に返す。after が空なら全部。
+export async function listMessages(conversationId: string, after = ""): Promise<Message[]> {
+  const q = after ? `?after=${encodeURIComponent(after)}` : "";
+  const res = await authFetch(`/conversations/${encodeURIComponent(conversationId)}/messages${q}`);
+  if (!res.ok) throw await dmError(res, "メッセージの取得に失敗しました");
+  return res.json();
+}
+
+export async function sendMessage(conversationId: string, body: string): Promise<Message> {
+  const res = await authFetch(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ body }),
+  });
+  if (!res.ok) throw await dmError(res, "送信に失敗しました");
+  return res.json();
+}
+
 export { API_URL };

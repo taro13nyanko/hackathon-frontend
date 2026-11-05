@@ -92,3 +92,32 @@ input, textarea {
 .thumb.small { width: 48px; font-size: 1.2rem; border-radius: 6px; }
 .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #e0f2fe; color: #075985; white-space: nowrap; }
 .sold-badge { background: #fee2e2; color: #991b1b; }
+
+/* メッセージ */
+.start-chat { margin-top: 8px; }
+.start-chat .ghost { width: 100%; max-width: 360px; padding: 12px; }
+.row.conv { grid-template-columns: 48px 1fr auto; }
+.conv-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.preview { font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.when { font-size: 0.75rem; white-space: nowrap; }
+.chat-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.chat-head h1 { margin-bottom: 4px; }
+.msgs { display: flex; flex-direction: column; gap: 8px; padding: 8px 0 16px; min-height: 40vh; }
+.msg { display: flex; flex-direction: column; align-items: flex-start; max-width: 80%; }
+.msg.me { align-self: flex-end; align-items: flex-end; }
+.bubble { margin: 0; padding: 8px 12px; border-radius: 14px; background: var(--bg-soft); white-space: pre-wrap; word-break: break-word; }
+.msg.me .bubble { background: var(--accent); color: var(--accent-ink); }
+.send { position: sticky; bottom: 0; display: flex; gap: 8px; align-items: flex-end; padding: 8px 0; background: #fff; }
+.send textarea { flex: 1; resize: vertical; }
+
+/* ヘッダーをスマホ幅でも1行に */
+.header button { white-space: nowrap; }
+.logo { white-space: nowrap; }
+.mypage-head { display: flex; align-items: center; justify-content: space-between; }
+@media (max-width: 480px) {
+  .header { padding: 10px 12px; }
+  .header-right, .who { gap: 6px; }
+  .header .primary, .header .small { padding: 6px 10px; font-size: 0.85rem; }
+  .header .logout { display: none; } /* スマホではマイページからログアウト */
+  .who .name { max-width: 5em; }
+}
