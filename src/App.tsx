@@ -5,6 +5,7 @@ import {
   ITEM_RULES,
   buyItem,
   createItem,
+  draftDescription,
   getItem,
   listItems,
   listMyItems,
@@ -14,6 +15,7 @@ import {
   sendMessage,
   startConversation,
   MESSAGE_MAX,
+  NOTES_MAX,
   type Conversation,
   type Item,
   type Message,
@@ -241,7 +243,33 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
   const [price, setPrice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [drafting, setDrafting] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const [before, setBefore] = useState<string | null>(null); // 下書きを入れる前の文（元に戻す用）
   const r = ITEM_RULES;
+
+  // 説明欄に書いたメモ（箇条書きでよい）を、Gemini が説明文に整える
+  const onDraft = async () => {
+    setAiError("");
+    if (!title.trim()) {
+      setAiError("先に商品名を入れてください");
+      return;
+    }
+    if (description.length > NOTES_MAX) {
+      setAiError(`メモは${NOTES_MAX}文字以内にしてください`);
+      return;
+    }
+    setDrafting(true);
+    try {
+      const text = await draftDescription(title.trim(), description.trim());
+      setBefore(description);
+      setDescription(text);
+    } catch (e) {
+      setAiError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDrafting(false);
+    }
+  };
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -278,9 +306,21 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
             onChange={(e) => setDescription(e.target.value)}
             maxLength={r.descriptionMax}
             rows={6}
-            placeholder="状態、使用期間、受け渡し方法など"
+            placeholder="状態、使用期間、受け渡し方法など（メモ書きでもOK。「AI で説明文に整える」で文章にできます）"
           />
         </label>
+        <div className="ai">
+          <button type="button" className="ghost" onClick={onDraft} disabled={drafting || busy}>
+            {drafting ? "Gemini が作成中…" : "AI で説明文に整える"}
+          </button>
+          {before !== null && !drafting && (
+            <button type="button" className="link" onClick={() => { setDescription(before); setBefore(null); }}>
+              元に戻す
+            </button>
+          )}
+          <small className="muted">商品名と説明欄のメモだけをもとに書きます。内容を確かめて直してから出品してください。</small>
+          {aiError && <p className="err">{aiError}</p>}
+        </div>
         <label>
           価格（円）
           <input

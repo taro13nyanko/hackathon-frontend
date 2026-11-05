@@ -129,6 +129,25 @@ export async function createItem(input: ItemInput): Promise<string> {
   return data.id;
 }
 
+// ---- Gemini（説明文の下書き） ----
+
+export const NOTES_MAX = 500; // バックエンドの usecase/description.go と同じ
+
+// draftDescription は商品名とメモから、説明文の下書きを Gemini に作ってもらう。
+export async function draftDescription(title: string, notes: string): Promise<string> {
+  const res = await authFetch("/items/description", { method: "POST", body: JSON.stringify({ title, notes }) });
+  if (res.ok) return ((await res.json()) as { description: string }).description;
+  const code = await errorCode(res);
+  const messages: Record<string, string> = {
+    invalid_input: `商品名（1〜${ITEM_RULES.titleMax}文字）を入れ、メモは${NOTES_MAX}文字以内にしてください`,
+    too_many: "少し時間をおいてから、もう一度お試しください（1分に5回まで）",
+    ai_failed: "下書きを作れませんでした。もう一度お試しください",
+    profile_required: "表示名を登録してください",
+    unauthorized: "ログインし直してください",
+  };
+  throw new ApiError(messages[code] ?? `下書きに失敗しました (HTTP ${res.status})`, res.status, code);
+}
+
 // ---- 購入・マイページ ----
 
 export type PurchaseRes = { purchase_id: string; item_id: string; price: number };

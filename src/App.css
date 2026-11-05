@@ -121,3 +121,8 @@ input, textarea {
   .header .logout { display: none; } /* スマホではマイページからログアウト */
   .who .name { max-width: 5em; }
 }
+
+/* Gemini（説明文の下書き） */
+.ai { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: -4px; }
+.ai small { flex-basis: 100%; }
+.ai .err { flex-basis: 100%; margin: 0; }
