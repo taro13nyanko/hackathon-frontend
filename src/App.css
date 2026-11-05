@@ -65,3 +65,10 @@ input, textarea {
 .detail { margin-top: 16px; max-width: 560px; }
 .status { color: var(--muted); margin: 4px 0 0; }
 .desc { white-space: pre-wrap; line-height: 1.7; }
+
+/* ログイン */
+.header-right { display: flex; align-items: center; gap: 8px; }
+.who { display: flex; align-items: center; gap: 8px; }
+.who .name { font-weight: 700; max-width: 10em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.small { padding: 6px 10px; font-size: 0.85rem; }
+.seller { color: var(--muted); }

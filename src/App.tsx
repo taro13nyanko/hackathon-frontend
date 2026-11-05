@@ -1,16 +1,19 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { API_URL, ITEM_RULES, createItem, getItem, listItems, type Item } from "./api";
+import { API_URL, DISPLAY_NAME_MAX, ITEM_RULES, createItem, getItem, listItems, type Item } from "./api";
+import { useAuth } from "./auth";
 import "./App.css";
 
 const yen = (n: number) => `¥${n.toLocaleString("ja-JP")}`;
 
 // 画面は3つ：一覧（list）／出品フォーム（sell）／商品詳細（detail）。
+// ログインして表示名が未登録のときは、どの画面よりも先にプロフィール登録を出す。
 // ページ遷移のライブラリ（React Router）は画面が増えてから入れる。
 type View = { kind: "list" } | { kind: "sell" } | { kind: "detail"; id: string };
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "list" });
   const [notice, setNotice] = useState("");
+  const { state, error: authError, login, logout } = useAuth();
 
   const goList = (msg = "") => {
     setNotice(msg);
@@ -23,22 +26,85 @@ export default function App() {
         <button className="logo" onClick={() => goList()}>
           フリマ
         </button>
-        {view.kind !== "sell" && (
-          <button className="primary" onClick={() => { setNotice(""); setView({ kind: "sell" }); }}>
-            出品する
-          </button>
-        )}
+        <div className="header-right">
+          {state.status === "ready" && view.kind !== "sell" && (
+            <button className="primary" onClick={() => { setNotice(""); setView({ kind: "sell" }); }}>
+              出品する
+            </button>
+          )}
+          {state.status === "signedOut" && (
+            <button className="primary" onClick={login}>
+              Google でログイン
+            </button>
+          )}
+          {(state.status === "ready" || state.status === "needsProfile") && (
+            <span className="who">
+              {state.status === "ready" && <span className="name">{state.me.display_name}</span>}
+              <button className="ghost small" onClick={() => { logout(); goList(); }}>
+                ログアウト
+              </button>
+            </span>
+          )}
+        </div>
       </header>
 
       <main>
+        {authError && <p className="err">{authError}</p>}
         {notice && <p className="ok">{notice}</p>}
-        {view.kind === "list" && <ItemList onOpen={(id) => { setNotice(""); setView({ kind: "detail", id }); }} />}
-        {view.kind === "sell" && <SellForm onDone={(id) => setView({ kind: "detail", id })} onCancel={() => goList()} />}
-        {view.kind === "detail" && <ItemDetail id={view.id} onBack={() => goList()} />}
+        {state.status === "needsProfile" ? (
+          <ProfileForm email={state.email} onDone={(name) => goList(`ようこそ、${name} さん`)} />
+        ) : (
+          <>
+            {view.kind === "list" && <ItemList onOpen={(id) => { setNotice(""); setView({ kind: "detail", id }); }} />}
+            {view.kind === "sell" && <SellForm onDone={(id) => setView({ kind: "detail", id })} onCancel={() => goList()} />}
+            {view.kind === "detail" && <ItemDetail id={view.id} onBack={() => goList()} />}
+          </>
+        )}
       </main>
 
       <footer className="api">API: {API_URL}</footer>
     </div>
+  );
+}
+
+// ---- プロフィール登録（初回ログイン時） ----
+function ProfileForm({ email, onDone }: { email: string; onDone: (name: string) => void }) {
+  const { register } = useAuth();
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await register(name.trim());
+      onDone(name.trim());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h1>はじめに表示名を決めてください</h1>
+      <p className="muted">{email} でログインしています。表示名は商品ページやメッセージで相手に見えます（メールアドレスは見えません）。</p>
+      <form className="sell" onSubmit={onSubmit}>
+        <label>
+          表示名 <small>（{name.length}/{DISPLAY_NAME_MAX}）</small>
+          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={DISPLAY_NAME_MAX} required autoFocus />
+        </label>
+        {error && <p className="err">{error}</p>}
+        <div className="actions">
+          <button className="primary" disabled={busy || !name.trim()}>
+            {busy ? "登録中…" : "はじめる"}
+          </button>
+        </div>
+      </form>
+    </section>
   );
 }
 
@@ -197,10 +263,11 @@ function ItemDetail({ id, onBack }: { id: string; onBack: () => void }) {
           <h1>{item.title}</h1>
           <p className="price big">{yen(item.price)}</p>
           <p className="status">{item.status === "on_sale" ? "出品中" : "売り切れ"}</p>
+          <p className="seller">出品者: {item.seller ? item.seller.display_name : "（見本データ）"}</p>
           <h2>商品の説明</h2>
           <p className="desc">{item.description || "（説明なし）"}</p>
           <p className="muted">出品日時: {new Date(item.created_at).toLocaleString("ja-JP")}</p>
-          {/* 購入ボタンはログイン機能のあとで付ける */}
+          {/* 購入ボタンは次の段階で付ける */}
         </article>
       )}
     </section>
