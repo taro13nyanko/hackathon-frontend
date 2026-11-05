@@ -72,3 +72,23 @@ input, textarea {
 .who .name { font-weight: 700; max-width: 10em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .small { padding: 6px 10px; font-size: 0.85rem; }
 .seller { color: var(--muted); }
+
+/* 購入・マイページ */
+.buy { margin: 16px 0; }
+.buy .primary { width: 100%; max-width: 360px; padding: 12px; }
+.buy .primary:disabled { background: #9ca3af; cursor: default; }
+.link { background: none; padding: 4px 0; color: var(--ink); text-decoration: underline; }
+.confirm { display: grid; grid-template-columns: 96px 1fr; gap: 16px; align-items: center; margin-bottom: 16px; }
+.confirm .thumb { border-radius: 8px; font-size: 2rem; }
+.confirm .title { font-size: 1rem; white-space: normal; margin: 0 0 4px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+.tabs button { background: none; border-radius: 0; padding: 10px 12px; color: var(--muted); border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--ink); font-weight: 700; border-bottom-color: var(--accent); }
+.rows { list-style: none; margin: 0; padding: 0; }
+.row {
+  width: 100%; display: grid; grid-template-columns: 48px 1fr auto auto; gap: 12px; align-items: center;
+  background: none; padding: 8px 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left;
+}
+.thumb.small { width: 48px; font-size: 1.2rem; border-radius: 6px; }
+.badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #e0f2fe; color: #075985; white-space: nowrap; }
+.sold-badge { background: #fee2e2; color: #991b1b; }

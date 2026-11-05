@@ -129,4 +129,36 @@ export async function createItem(input: ItemInput): Promise<string> {
   return data.id;
 }
 
+// ---- 購入・マイページ ----
+
+export type PurchaseRes = { purchase_id: string; item_id: string; price: number };
+export type Purchase = { id: string; item: Item; price: number; created_at: string };
+
+// buyItem は商品を買う（決済なし）。売り切れ・自分の商品のときは理由をメッセージにする。
+export async function buyItem(id: string): Promise<PurchaseRes> {
+  const res = await authFetch(`/items/${encodeURIComponent(id)}/purchase`, { method: "POST" });
+  if (res.ok) return res.json();
+  const code = await errorCode(res);
+  const messages: Record<string, string> = {
+    already_sold: "ごめんなさい、この商品は売り切れました",
+    own_item: "自分が出品した商品は買えません",
+    not_found: "この商品は見つかりませんでした",
+    profile_required: "表示名を登録してから購入してください",
+    unauthorized: "ログインし直してください",
+  };
+  throw new ApiError(messages[code] ?? `購入に失敗しました (HTTP ${res.status})`, res.status, code);
+}
+
+export async function listMyItems(): Promise<Item[]> {
+  const res = await authFetch("/me/items");
+  if (!res.ok) throw new ApiError(`出品した商品の取得に失敗しました (HTTP ${res.status})`, res.status, await errorCode(res));
+  return res.json();
+}
+
+export async function listMyPurchases(): Promise<Purchase[]> {
+  const res = await authFetch("/me/purchases");
+  if (!res.ok) throw new ApiError(`購入した商品の取得に失敗しました (HTTP ${res.status})`, res.status, await errorCode(res));
+  return res.json();
+}
+
 export { API_URL };
