@@ -258,3 +258,55 @@ export async function sendMessage(conversationId: string, body: string): Promise
 }
 
 export { API_URL };
+
+// ---- 3D 模型（写真 → Gemini が部品の設計図を返す） ----
+
+// FigurePart / Figure はバックエンドの usecase/figure.go と同じ形。
+export type FigurePart = {
+  shape: "box" | "cylinder" | "cone" | "sphere" | "dome" | "capsule" | "torus" | "label";
+  size: number[];
+  pos: [number, number, number];
+  rot?: [number, number, number];
+  scale?: [number, number, number];
+  color?: string;
+  round?: number;
+  arc?: number;
+  glow?: boolean;
+  outline?: boolean;
+  text?: string;
+  ink?: string;
+  bg?: string;
+};
+export type Figure = {
+  name: string;
+  caption: string;
+  parts: FigurePart[];
+  face?: { part: number; style: "smile" | "wink" | "sleepy" | "open"; y?: number; scale?: number };
+};
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(new Error("写真を読み込めませんでした"));
+    r.readAsDataURL(blob);
+  });
+}
+
+// makeFigure は商品の写真から 3D 模型の設計図を作ってもらう（ログイン＋表示名が必要、1分に3回まで）。
+export async function makeFigure(photoImageId: string, name: string): Promise<Figure> {
+  const img = await fetch(imageUrl(photoImageId));
+  if (!img.ok) throw new Error(`写真を取得できませんでした (HTTP ${img.status})`);
+  const image = await blobToBase64(await img.blob());
+  const res = await authFetch("/figures", { method: "POST", body: JSON.stringify({ image, name }) });
+  if (res.ok) return ((await res.json()) as { figure: Figure }).figure;
+  const code = await errorCode(res);
+  const messages: Record<string, string> = {
+    invalid_input: "この写真は使えません（JPEG・PNG・WebP、4MB まで）",
+    too_many: "少し時間をおいてから、もう一度お試しください（1分に3回まで）",
+    ai_failed: "模型を作れませんでした。もう一度お試しください",
+    profile_required: "表示名を登録してください",
+    unauthorized: "ログインしてください",
+  };
+  throw new ApiError(messages[code] ?? `模型の作成に失敗しました (HTTP ${res.status})`, res.status, code);
+}

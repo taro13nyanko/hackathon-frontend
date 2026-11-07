@@ -139,3 +139,10 @@ img.thumb.large { max-width: 360px; }
 }
 .photo-box img { width: 100%; height: 100%; object-fit: cover; }
 .photo-pick .err { flex-basis: 100%; margin: 0; }
+
+/* 3D 模型 */
+.figure-maker { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 12px; }
+.figure-card { margin: 0; width: 100%; max-width: 360px; background: #fff8ef; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.figure3d { display: block; width: 100%; aspect-ratio: 1; cursor: grab; touch-action: none; }
+.figure-card figcaption { padding: 8px 12px 12px; font-size: 0.9rem; display: flex; flex-direction: column; gap: 4px; }
+.figure-card small { color: var(--muted); }

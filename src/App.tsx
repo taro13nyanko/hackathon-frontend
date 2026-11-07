@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   API_URL,
   DISPLAY_NAME_MAX,
@@ -9,6 +9,7 @@ import {
   getItem,
   imageUrl,
   listItems,
+  makeFigure,
   shrinkImage,
   uploadImage,
   listMyItems,
@@ -20,12 +21,16 @@ import {
   MESSAGE_MAX,
   NOTES_MAX,
   type Conversation,
+  type Figure,
   type Item,
   type Message,
   type Purchase,
 } from "./api";
 import { useAuth } from "./auth";
 import "./App.css";
+
+// 3D 模型の表示（three.js は大きいので、使うときだけ読み込む）
+const Figure3D = lazy(() => import("./Figure3D"));
 
 const yen = (n: number) => `¥${n.toLocaleString("ja-JP")}`;
 
@@ -435,6 +440,7 @@ function ItemDetail({
           {item.figure_image_id && item.photo_image_id && (
             <img className="photo" src={imageUrl(item.photo_image_id)} alt={`${item.title}の写真`} loading="lazy" />
           )}
+          {item.photo_image_id && <FigureMaker item={item} canMake={state.status === "ready"} />}
           <h1>{item.title}</h1>
           <p className="price big">{yen(item.price)}</p>
           <p className="status">{item.status === "on_sale" ? "出品中" : "売り切れ"}</p>
@@ -465,6 +471,49 @@ function ItemDetail({
         </article>
       )}
     </section>
+  );
+}
+
+// ---- 3D 模型（写真から Gemini が部品を決め、画面で組み立てる） ----
+function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
+  const [figure, setFigure] = useState<Figure | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function make() {
+    setBusy(true);
+    setError("");
+    try {
+      setFigure(await makeFigure(item.photo_image_id, item.title));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="figure-maker">
+      {figure && (
+        <figure className="figure-card">
+          <Suspense fallback={<p className="muted">模型を準備中…</p>}>
+            <Figure3D figure={figure} />
+          </Suspense>
+          <figcaption>
+            <b>{figure.name}</b> {figure.caption}
+            <small>ドラッグで回せます</small>
+          </figcaption>
+        </figure>
+      )}
+      {canMake ? (
+        <button className="ghost" onClick={make} disabled={busy}>
+          {busy ? "AI が模型を考え中…（10秒ほど）" : figure ? "もう一度つくる" : "✨ 写真から3D模型をつくる"}
+        </button>
+      ) : (
+        <p className="muted">ログインすると、写真から3D模型をつくれます</p>
+      )}
+      {error && <p className="err">{error}</p>}
+    </div>
   );
 }
 
