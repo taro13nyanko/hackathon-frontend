@@ -507,7 +507,7 @@ function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
       )}
       {canMake ? (
         <button className="ghost" onClick={make} disabled={busy}>
-          {busy ? "AI が模型を考え中…（10秒ほど）" : figure ? "もう一度つくる" : "✨ 写真から3D模型をつくる"}
+          {busy ? "AI が写真をよく見て模型を考え中…（1分ほどかかります）" : figure ? "もう一度つくる" : "✨ 写真から3D模型をつくる"}
         </button>
       ) : (
         <p className="muted">ログインすると、写真から3D模型をつくれます</p>
