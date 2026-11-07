@@ -60,7 +60,7 @@ async function authFetch(path: string, init: RequestInit = {}): Promise<Response
   const token = await user.getIdToken();
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
-  if (init.body) headers.set("Content-Type", "application/json");
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   return fetch(`${API_URL}${path}`, { ...init, headers });
 }
 
@@ -92,9 +92,37 @@ export type Item = {
   price: number;
   status: ItemStatus;
   seller: Member | null; // 見本データは null
+  photo_image_id: string; // 無ければ ""
+  figure_image_id: string;
+  figure_caption: string;
   created_at: string; // ISO 8601
 };
-export type ItemInput = { title: string; description: string; price: number };
+export type ItemInput = { title: string; description: string; price: number; photo_image_id?: string };
+
+// imageUrl は画像の URL（GET /images/{id}）。
+export const imageUrl = (id: string) => `${API_URL}/images/${encodeURIComponent(id)}`;
+
+// shrinkImage は写真を長い辺 768px の JPEG に縮める（スマホの写真は数MBあるため）。向き（EXIF）も直す。
+export async function shrinkImage(file: File, max = 768): Promise<Blob> {
+  const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bmp.width * scale);
+  canvas.height = Math.round(bmp.height * scale);
+  canvas.getContext("2d")!.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close();
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("画像を変換できませんでした"))), "image/jpeg", 0.85),
+  );
+}
+
+// uploadImage は画像を上げて ID を返す（ログイン＋表示名が必要）。
+export async function uploadImage(blob: Blob): Promise<string> {
+  const res = await authFetch("/images", { method: "POST", body: blob, headers: { "Content-Type": blob.type } });
+  if (res.status === 400) throw new ApiError("この画像は使えません（JPEG・PNG・WebP、1.5MB まで）", 400, "invalid_input");
+  if (!res.ok) throw new ApiError(`写真を上げられませんでした (HTTP ${res.status})`, res.status, await errorCode(res));
+  return ((await res.json()) as { id: string }).id;
+}
 
 // 出品の決まり（バックエンドの usecase/item.go と同じ値にしておく）
 export const ITEM_RULES = { titleMax: 40, descriptionMax: 1000, priceMin: 300, priceMax: 9_999_999 };
