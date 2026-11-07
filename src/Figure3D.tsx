@@ -13,16 +13,8 @@ export default function Figure3D({ figure }: { figure: Figure }) {
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     const scene = new THREE.Scene();
-    scene.add(new THREE.HemisphereLight(0xffffff, 0xe8d6bf, 1.3));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.9);
-    sun.position.set(-3, 5, 4);
-    scene.add(sun);
-    const rim = new THREE.DirectionalLight(0xffe2c4, 0.5);
-    rim.position.set(4, 2, -3);
-    scene.add(rim);
-    const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
-    camera.position.set(0, 2.4, 6.2);
-    camera.lookAt(0, 1.05, 0);
+    addLights(scene);
+    const camera = makeCamera(1);
 
     const spin = new THREE.Group();
     const model = build(figure);
@@ -77,6 +69,57 @@ export default function Figure3D({ figure }: { figure: Figure }) {
   }, [figure]);
 
   return <canvas ref={ref} className="figure3d" aria-label={`${figure.name}の3D模型`} />;
+}
+
+// renderSnapshot は設計図を画面に出さずに描き、正面と斜め45°の2枚を横に並べた JPEG（data URL）を返す。
+// AI に「前回の模型」を見せて直させる（仕上げ）ために使う。
+export function renderSnapshot(figure: Figure, size = 448): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size * 2;
+  canvas.height = size;
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  renderer.setClearColor(0xfff8ef, 1);
+  renderer.setScissorTest(true);
+  const scene = new THREE.Scene();
+  addLights(scene);
+  const spin = new THREE.Group();
+  spin.add(build(figure));
+  scene.add(spin, shadow());
+  const camera = makeCamera(1);
+  [0, -Math.PI / 4].forEach((angle, i) => {
+    spin.rotation.y = angle;
+    renderer.setViewport(i * size, 0, size, size);
+    renderer.setScissor(i * size, 0, size, size);
+    renderer.render(scene, camera);
+  });
+  const url = canvas.toDataURL("image/jpeg", 0.9);
+  scene.traverse((o) => {
+    if (o instanceof THREE.Mesh) {
+      o.geometry.dispose();
+      const m = o.material as THREE.Material & { map?: THREE.Texture | null };
+      m.map?.dispose();
+      m.dispose();
+    }
+  });
+  renderer.dispose();
+  return url;
+}
+
+function addLights(scene: THREE.Scene) {
+  scene.add(new THREE.HemisphereLight(0xffffff, 0xe8d6bf, 1.3));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.9);
+  sun.position.set(-3, 5, 4);
+  scene.add(sun);
+  const rim = new THREE.DirectionalLight(0xffe2c4, 0.5);
+  rim.position.set(4, 2, -3);
+  scene.add(rim);
+}
+
+function makeCamera(aspect: number) {
+  const camera = new THREE.PerspectiveCamera(32, aspect, 0.1, 100);
+  camera.position.set(0, 2.4, 6.2);
+  camera.lookAt(0, 1.05, 0);
+  return camera;
 }
 
 // ===== 組み立て =====

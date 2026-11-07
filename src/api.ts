@@ -282,6 +282,7 @@ export type Figure = {
   caption: string;
   parts: FigurePart[];
   face?: { part: number; style: "smile" | "wink" | "sleepy" | "open"; y?: number; scale?: number };
+  engine?: string; // どのモデルで作ったか（main / fallback）
 };
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -293,19 +294,24 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-// makeFigure は商品の写真から 3D 模型の設計図を作ってもらう（ログイン＋表示名が必要、1分に3回まで）。
-export async function makeFigure(photoImageId: string, name: string): Promise<Figure> {
+// makeFigure は商品の写真から 3D 模型の設計図を作ってもらう（ログイン＋表示名が必要）。
+// refine を渡すと「仕上げ」：前回の設計図と、それを描いた画像を写真と見比べて直してもらう。
+export async function makeFigure(
+  photoImageId: string,
+  name: string,
+  refine?: { previous: Figure; render: string },
+): Promise<Figure> {
   // cache: "reload" … <img> で先に読んだ画像はブラウザのキャッシュに CORS の許可なしで残るため、
   // そのまま fetch すると "Failed to fetch" になる。サーバーから取り直す。
   const img = await fetch(imageUrl(photoImageId), { cache: "reload" });
   if (!img.ok) throw new Error(`写真を取得できませんでした (HTTP ${img.status})`);
   const image = await blobToBase64(await img.blob());
-  const res = await authFetch("/figures", { method: "POST", body: JSON.stringify({ image, name }) });
+  const res = await authFetch("/figures", { method: "POST", body: JSON.stringify({ image, name, ...refine }) });
   if (res.ok) return ((await res.json()) as { figure: Figure }).figure;
   const code = await errorCode(res);
   const messages: Record<string, string> = {
     invalid_input: "この写真は使えません（JPEG・PNG・WebP、4MB まで）",
-    too_many: "少し時間をおいてから、もう一度お試しください（1分に3回まで）",
+    too_many: "少し時間をおいてから、もう一度お試しください（1分に6回まで）",
     ai_failed: "模型を作れませんでした。もう一度お試しください",
     profile_required: "表示名を登録してください",
     unauthorized: "ログインしてください",

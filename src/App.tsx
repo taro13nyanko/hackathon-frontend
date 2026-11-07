@@ -477,21 +477,36 @@ function ItemDetail({
 // ---- 3D 模型（写真から Gemini が部品を決め、画面で組み立てる） ----
 function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
   const [figure, setFigure] = useState<Figure | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState<"" | "draft" | "refine">("");
   const [error, setError] = useState("");
 
+  // 2段階でつくる：① 写真から下書き → ② 下書きを描いた画像と写真を見比べて仕上げ（下書きは先に見せておく）
   async function make() {
-    setBusy(true);
     setError("");
+    setPhase("draft");
+    let draft: Figure;
     try {
-      setFigure(await makeFigure(item.photo_image_id, item.title));
+      draft = await makeFigure(item.photo_image_id, item.title);
+      setFigure(draft);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      setPhase("");
+      return;
+    }
+    setPhase("refine");
+    try {
+      const { renderSnapshot } = await import("./Figure3D");
+      const render = renderSnapshot(draft);
+      setFigure(await makeFigure(item.photo_image_id, item.title, { previous: draft, render }));
+    } catch (e) {
+      // 仕上げに失敗しても下書きは残す
+      setError("仕上げはできませんでした（下書きを表示しています）: " + (e instanceof Error ? e.message : String(e)));
     } finally {
-      setBusy(false);
+      setPhase("");
     }
   }
 
+  const busy = phase !== "";
   return (
     <div className="figure-maker">
       {figure && (
@@ -501,13 +516,19 @@ function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
           </Suspense>
           <figcaption>
             <b>{figure.name}</b> {figure.caption}
-            <small>ドラッグで回せます</small>
+            <small>{phase === "refine" ? "下書きです。AI が写真と見比べて仕上げています…" : "ドラッグで回せます"}</small>
           </figcaption>
         </figure>
       )}
       {canMake ? (
         <button className="ghost" onClick={make} disabled={busy}>
-          {busy ? "AI が写真をよく見て模型を考え中…（1分ほどかかります）" : figure ? "もう一度つくる" : "✨ 写真から3D模型をつくる"}
+          {phase === "draft"
+            ? "AI が写真をよく見て下書き中…（1分ほど）"
+            : phase === "refine"
+              ? "写真と見比べて仕上げ中…（もう1分ほど）"
+              : figure
+                ? "もう一度つくる"
+                : "✨ 写真から3D模型をつくる"}
         </button>
       ) : (
         <p className="muted">ログインすると、写真から3D模型をつくれます</p>
