@@ -126,3 +126,16 @@ input, textarea {
 .ai { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: -4px; }
 .ai small { flex-basis: 100%; }
 .ai .err { flex-basis: 100%; margin: 0; }
+
+/* 写真 */
+img.thumb { width: 100%; object-fit: cover; display: block; }
+img.thumb.small { height: 48px; }
+img.thumb.large { max-width: 360px; }
+.detail .photo { display: block; width: 160px; margin-top: 8px; border-radius: 8px; }
+.photo-pick { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.photo-box {
+  width: 120px; height: 120px; border: 2px dashed var(--line); border-radius: 12px; display: grid; place-items: center;
+  color: var(--muted); cursor: pointer; overflow: hidden; background: var(--bg-soft); font-size: 0.85rem; text-align: center;
+}
+.photo-box img { width: 100%; height: 100%; object-fit: cover; }
+.photo-pick .err { flex-basis: 100%; margin: 0; }

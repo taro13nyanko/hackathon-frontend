@@ -7,7 +7,10 @@ import {
   createItem,
   draftDescription,
   getItem,
+  imageUrl,
   listItems,
+  shrinkImage,
+  uploadImage,
   listMyItems,
   listMyPurchases,
   listConversations,
@@ -139,6 +142,17 @@ export default function App() {
   );
 }
 
+// ---- 商品の見た目（模型 → 写真 → 頭文字の順で、あるものを出す） ----
+function Thumb({ item, className = "thumb" }: { item: Item; className?: string }) {
+  const id = item.figure_image_id || item.photo_image_id;
+  if (id) return <img className={`${className} img`} src={imageUrl(id)} alt="" loading="lazy" />;
+  return (
+    <div className={className} aria-hidden>
+      {item.title.slice(0, 1)}
+    </div>
+  );
+}
+
 // ---- プロフィール登録（初回ログイン時） ----
 function ProfileForm({ email, onDone }: { email: string; onDone: (name: string) => void }) {
   const { register } = useAuth();
@@ -222,7 +236,7 @@ function ItemList({ onOpen }: { onOpen: (id: string) => void }) {
         {items?.map((it) => (
           <li key={it.id}>
             <button className="card" onClick={() => onOpen(it.id)}>
-              <div className="thumb" aria-hidden>{it.title.slice(0, 1)}</div>
+              <Thumb item={it} />
               <div className="card-body">
                 <span className="title">{it.title}</span>
                 <span className="price">{yen(it.price)}</span>
@@ -246,6 +260,25 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
   const [drafting, setDrafting] = useState(false);
   const [aiError, setAiError] = useState("");
   const [before, setBefore] = useState<string | null>(null); // 下書きを入れる前の文（元に戻す用）
+  const [photo, setPhoto] = useState<{ id: string; preview: string } | null>(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [photoError, setPhotoError] = useState("");
+
+  // 写真を選んだら、縮めてすぐ上げる（出品ボタンを押したときに待たせない）
+  const onPhoto = async (file: File | undefined) => {
+    if (!file) return;
+    setPhotoError("");
+    setPhotoBusy(true);
+    try {
+      const blob = await shrinkImage(file);
+      const id = await uploadImage(blob);
+      setPhoto({ id, preview: URL.createObjectURL(blob) });
+    } catch (e) {
+      setPhotoError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
   const r = ITEM_RULES;
 
   // 説明欄に書いたメモ（箇条書きでよい）を、Gemini が説明文に整える
@@ -282,7 +315,7 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
     setBusy(true);
     setError("");
     try {
-      const id = await createItem({ title: title.trim(), description: description.trim(), price: p });
+      const id = await createItem({ title: title.trim(), description: description.trim(), price: p, photo_image_id: photo?.id });
       onDone(id);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -295,6 +328,24 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
     <section>
       <h1>商品を出品</h1>
       <form className="sell" onSubmit={onSubmit}>
+        <div className="photo-pick">
+          <label className="photo-box">
+            {photo ? <img src={photo.preview} alt="選んだ写真" /> : <span>{photoBusy ? "写真を準備中…" : "＋ 写真を追加"}</span>}
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => onPhoto(e.target.files?.[0])}
+              disabled={photoBusy || busy}
+              hidden
+            />
+          </label>
+          {photo && !photoBusy && (
+            <button type="button" className="link" onClick={() => setPhoto(null)}>
+              写真を外す
+            </button>
+          )}
+          {photoError && <p className="err">{photoError}</p>}
+        </div>
         <label>
           商品名 <small>（{title.length}/{r.titleMax}）</small>
           <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={r.titleMax} required />
@@ -340,7 +391,7 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
           <button type="button" className="ghost" onClick={onCancel}>
             やめる
           </button>
-          <button className="primary" disabled={busy}>
+          <button className="primary" disabled={busy || photoBusy}>
             {busy ? "出品中…" : "出品する"}
           </button>
         </div>
@@ -380,7 +431,10 @@ function ItemDetail({
       {!item && !error && <p className="muted">読み込み中…</p>}
       {item && (
         <article className="detail">
-          <div className="thumb large" aria-hidden>{item.title.slice(0, 1)}</div>
+          <Thumb item={item} className="thumb large" />
+          {item.figure_image_id && item.photo_image_id && (
+            <img className="photo" src={imageUrl(item.photo_image_id)} alt={`${item.title}の写真`} loading="lazy" />
+          )}
           <h1>{item.title}</h1>
           <p className="price big">{yen(item.price)}</p>
           <p className="status">{item.status === "on_sale" ? "出品中" : "売り切れ"}</p>
@@ -436,7 +490,7 @@ function BuyConfirm({ item, onDone, onCancel }: { item: Item; onDone: (item: Ite
     <section>
       <h1>購入内容の確認</h1>
       <div className="confirm">
-        <div className="thumb" aria-hidden>{item.title.slice(0, 1)}</div>
+        <Thumb item={item} />
         <div>
           <p className="title">{item.title}</p>
           <p className="muted">出品者: {item.seller ? item.seller.display_name : "（見本データ）"}</p>
@@ -530,7 +584,7 @@ function MyPage({ onOpen, onLogout }: { onOpen: (id: string) => void; onLogout: 
         {rows?.map((it) => (
           <li key={it.id}>
             <button className="row" onClick={() => onOpen(it.id)}>
-              <span className="thumb small" aria-hidden>{it.title.slice(0, 1)}</span>
+              <Thumb item={it} className="thumb small" />
               <span className="title">{it.title}</span>
               <span className="price">{yen(it.price)}</span>
               {tab === "selling" && <span className={it.status === "sold" ? "badge sold-badge" : "badge"}>{it.status === "sold" ? "売れました" : "出品中"}</span>}
@@ -592,7 +646,7 @@ function Inbox({ onOpen }: { onOpen: (conv: Conversation) => void }) {
         {convs?.map((c) => (
           <li key={c.id}>
             <button className="row conv" onClick={() => onOpen(c)}>
-              <span className="thumb small" aria-hidden>{c.item.title.slice(0, 1)}</span>
+              <Thumb item={c.item} className="thumb small" />
               <span className="conv-main">
                 <span className="title">
                   {c.partner.display_name} <small className="muted">・{c.item.title}</small>
