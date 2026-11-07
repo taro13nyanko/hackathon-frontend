@@ -295,7 +295,9 @@ function blobToBase64(blob: Blob): Promise<string> {
 
 // makeFigure は商品の写真から 3D 模型の設計図を作ってもらう（ログイン＋表示名が必要、1分に3回まで）。
 export async function makeFigure(photoImageId: string, name: string): Promise<Figure> {
-  const img = await fetch(imageUrl(photoImageId));
+  // cache: "reload" … <img> で先に読んだ画像はブラウザのキャッシュに CORS の許可なしで残るため、
+  // そのまま fetch すると "Failed to fetch" になる。サーバーから取り直す。
+  const img = await fetch(imageUrl(photoImageId), { cache: "reload" });
   if (!img.ok) throw new Error(`写真を取得できませんでした (HTTP ${img.status})`);
   const image = await blobToBase64(await img.blob());
   const res = await authFetch("/figures", { method: "POST", body: JSON.stringify({ image, name }) });
