@@ -14,12 +14,11 @@ export default function Figure3D({ figure }: { figure: Figure }) {
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     const scene = new THREE.Scene();
     addLights(scene);
-    const camera = makeCamera(1);
-
     const spin = new THREE.Group();
     const model = build(figure);
+    const camera = makeCamera(model, 1);
     spin.add(model);
-    scene.add(spin, shadow());
+    scene.add(spin, shadow(model));
 
     // ドラッグで回す。離して2.5秒たつと、また正面でゆらゆら
     let down = false, lx = 0, auto = true, timer = 0;
@@ -83,9 +82,10 @@ export function renderSnapshot(figure: Figure, size = 448): string {
   const scene = new THREE.Scene();
   addLights(scene);
   const spin = new THREE.Group();
-  spin.add(build(figure));
-  scene.add(spin, shadow());
-  const camera = makeCamera(1);
+  const model = build(figure);
+  spin.add(model);
+  scene.add(spin, shadow(model));
+  const camera = makeCamera(model, 1);
   [0, -Math.PI / 4].forEach((angle, i) => {
     spin.rotation.y = angle;
     renderer.setViewport(i * size, 0, size, size);
@@ -115,10 +115,19 @@ function addLights(scene: THREE.Scene) {
   scene.add(rim);
 }
 
-function makeCamera(aspect: number) {
-  const camera = new THREE.PerspectiveCamera(32, aspect, 0.1, 100);
-  camera.position.set(0, 2.4, 6.2);
-  camera.lookAt(0, 1.05, 0);
+// makeCamera は模型の大きさに合わせてカメラを置く（全体が画面に収まる距離。平たい物＝料理などは上から見下ろす）。
+function makeCamera(model: THREE.Object3D, aspect: number) {
+  const size = (model.userData.size as THREE.Vector3) ?? new THREE.Vector3(2.2, 2.2, 2.2);
+  const fov = 32;
+  const camera = new THREE.PerspectiveCamera(fov, aspect, 0.1, 100);
+  const wide = Math.max(size.x, size.z);
+  const flat = size.y < wide * 0.6;
+  const elev = ((flat ? 36 : 16) * Math.PI) / 180;
+  const radius = size.length() / 2;
+  const dist = (radius / Math.sin(((fov / 2) * Math.PI) / 180)) * 0.98;
+  const cy = size.y * 0.45;
+  camera.position.set(0, cy + dist * Math.sin(elev), dist * Math.cos(elev));
+  camera.lookAt(0, cy, 0);
   return camera;
 }
 
@@ -228,11 +237,13 @@ function build(f: Figure) {
     meshes.push(m);
   }
   addFace(g, f, meshes);
-  // 高さをそろえて床に立たせる
+  // 一番長い辺を 2.4 にそろえ、真ん中を原点に、床（y=0）に立たせる。大きさはカメラ合わせ用に残す
   const box = new THREE.Box3().setFromObject(g), size = box.getSize(new THREE.Vector3());
-  const k = 2.2 / Math.max(size.y, size.x, 0.001);
+  const center = box.getCenter(new THREE.Vector3());
+  const k = 2.4 / Math.max(size.x, size.y, size.z, 0.001);
   g.scale.setScalar(k);
-  g.position.y = -box.min.y * k;
+  g.position.set(-center.x * k, -box.min.y * k, -center.z * k);
+  g.userData.size = size.clone().multiplyScalar(k);
   return g;
 }
 
@@ -285,7 +296,9 @@ function addFace(group: THREE.Group, f: Figure, meshes: THREE.Mesh[]) {
   }
 }
 
-function shadow() {
+function shadow(model: THREE.Object3D) {
+  const size = (model.userData.size as THREE.Vector3) ?? new THREE.Vector3(2.2, 2.2, 2.2);
+  const r = Math.max(size.x, size.z) * 1.25;
   const c = document.createElement("canvas");
   c.width = c.height = 64;
   const x = c.getContext("2d")!, gr = x.createRadialGradient(32, 32, 2, 32, 32, 32);
@@ -294,7 +307,7 @@ function shadow() {
   x.fillStyle = gr;
   x.fillRect(0, 0, 64, 64);
   const m = new THREE.Mesh(
-    new THREE.PlaneGeometry(2.6, 2.6),
+    new THREE.PlaneGeometry(r, r),
     new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }),
   );
   m.rotation.x = -Math.PI / 2;
