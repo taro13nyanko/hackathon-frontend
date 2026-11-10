@@ -203,10 +203,14 @@ function geometry(p: FigurePart): THREE.BufferGeometry {
 
 // 文字の札（canvas に描いて貼る）
 function labelMesh(p: FigurePart) {
-  const [w, h] = p.size, c = document.createElement("canvas");
+  // 細長すぎる札は巨大な絵になってブラウザが固まるので、幅と高さ÷幅をここでも直す（backend と同じ決まり）
+  const w = Math.min(4, Math.max(0.1, p.size[0] || 0.1));
+  const h = Math.min(w, Math.max(w * 0.1, p.size[1] || w * 0.25));
+  const c = document.createElement("canvas");
   c.width = 512;
-  c.height = Math.max(16, Math.round((512 * h) / w));
-  const x = c.getContext("2d")!;
+  c.height = Math.min(512, Math.max(16, Math.round((512 * h) / w)));
+  const x = c.getContext("2d");
+  if (!x) return new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: p.bg || "#ffffff" }));
   if (p.bg) {
     x.fillStyle = p.bg;
     const r = c.height * 0.3;
@@ -231,7 +235,9 @@ function labelMesh(p: FigurePart) {
 export function build(f: Figure) {
   const g = new THREE.Group();
   const meshes: THREE.Mesh[] = [];
-  for (const p of f.parts) {
+  let labels = 0;
+  for (const p of f.parts.slice(0, 60)) {
+    if (p.shape === "label" && ++labels > 6) continue;
     const holder = new THREE.Group();
     let m: THREE.Mesh;
     if (p.shape === "label") {

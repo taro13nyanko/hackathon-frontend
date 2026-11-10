@@ -4,35 +4,6 @@ import { auth } from "./firebase";
 // 例: https://hackathon-backend-xxxxxxxx-uc.a.run.app （末尾の / は不要）
 const API_URL = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
-export type User = { id: string; name: string; age: number };
-
-export async function listUsers(): Promise<User[]> {
-  const res = await fetch(`${API_URL}/users`);
-  if (!res.ok) throw new Error(`一覧の取得に失敗しました (HTTP ${res.status})`);
-  return res.json();
-}
-
-export async function searchUsers(name: string): Promise<User[]> {
-  const res = await fetch(`${API_URL}/user?name=${encodeURIComponent(name)}`);
-  if (!res.ok) throw new Error(`検索に失敗しました (HTTP ${res.status})`);
-  return res.json();
-}
-
-export async function createUser(name: string, age: number): Promise<string> {
-  const res = await fetch(`${API_URL}/user`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, age }),
-  });
-  if (res.status === 400) throw new Error("名前は1〜50文字、年齢は20〜80で入力してください");
-  if (!res.ok) throw new Error(`登録に失敗しました (HTTP ${res.status})`);
-  const data: { id: string } = await res.json();
-  return data.id;
-}
-
-// ---- ログイン ----
-
-// ApiError はバックエンドの {"error": "<コード>"} を持ったエラー。
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -121,6 +92,16 @@ export async function shrinkImage(file: File, max = 768): Promise<Blob> {
 export async function uploadImage(blob: Blob): Promise<string> {
   const res = await authFetch("/images", { method: "POST", body: blob, headers: { "Content-Type": blob.type } });
   if (res.status === 400) throw new ApiError("この画像は使えません（JPEG・PNG・WebP、1.5MB まで）", 400, "invalid_input");
+  if (res.status === 429) {
+    const code = await errorCode(res);
+    throw new ApiError(
+      code === "image_quota"
+        ? "写真は24時間に100枚までです。時間をおいてから、もう一度お試しください"
+        : "写真を続けて上げすぎです。1分ほど待ってから、もう一度お試しください（1分に10枚まで）",
+      429,
+      code,
+    );
+  }
   if (!res.ok) throw new ApiError(`写真を上げられませんでした (HTTP ${res.status})`, res.status, await errorCode(res));
   return ((await res.json()) as { id: string }).id;
 }
@@ -153,6 +134,7 @@ export async function createItem(input: ItemInput): Promise<string> {
   }
   if (res.status === 401) throw new ApiError("ログインし直してください", 401, "unauthorized");
   if (res.status === 403) throw new ApiError("表示名を登録してから出品してください", 403, "profile_required");
+  if (res.status === 429) throw new ApiError("出品が続きすぎです。1分ほど待ってから、もう一度お試しください（1分に10件まで）", 429, "too_many");
   if (!res.ok) throw new Error(`出品に失敗しました (HTTP ${res.status})`);
   const data: { id: string } = await res.json();
   return data.id;
@@ -224,6 +206,7 @@ async function dmError(res: Response, fallback: string): Promise<ApiError> {
     not_found: "見つかりませんでした",
     invalid_input: `メッセージは1〜${MESSAGE_MAX}文字で入力してください`,
     unauthorized: "ログインし直してください",
+    too_many: "メッセージが続きすぎです。1分ほど待ってから、もう一度お試しください（1分に30通まで）",
   };
   return new ApiError(messages[code] ?? `${fallback} (HTTP ${res.status})`, res.status, code);
 }

@@ -28,6 +28,7 @@ import {
   type Purchase,
 } from "./api";
 import { useAuth } from "./auth";
+import ErrorBoundary from "./ErrorBoundary";
 import type { GardenEntry } from "./Garden3D";
 import "./App.css";
 
@@ -559,9 +560,11 @@ function FigureMaker({ item, myId, onSaved }: { item: Item; myId: string | null;
     <div className="figure-maker">
       {figure && (
         <figure className="figure-card">
-          <Suspense fallback={<p className="muted">模型を準備中…</p>}>
-            <Figure3D figure={figure} />
-          </Suspense>
+          <ErrorBoundary fallback={<p className="muted">この模型は表示できませんでした</p>}>
+            <Suspense fallback={<p className="muted">模型を準備中…</p>}>
+              <Figure3D figure={figure} />
+            </Suspense>
+          </ErrorBoundary>
           <figcaption>
             <b>{figure.name}</b> {figure.caption}
             <small>
@@ -778,9 +781,11 @@ function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () =
           </p>
           {data.entries.length > 0 ? (
             <div className="garden-card">
-              <Suspense fallback={<p className="muted">箱庭を準備中…</p>}>
-                <Garden3D entries={data.entries} onOpen={onOpen} />
-              </Suspense>
+              <ErrorBoundary fallback={<p className="muted">箱庭を表示できませんでした</p>}>
+                <Suspense fallback={<p className="muted">箱庭を準備中…</p>}>
+                  <Garden3D entries={data.entries} onOpen={onOpen} />
+                </Suspense>
+              </ErrorBoundary>
             </div>
           ) : (
             <p className="garden-empty">
