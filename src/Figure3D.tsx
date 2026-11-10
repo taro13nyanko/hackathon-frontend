@@ -20,10 +20,18 @@ export default function Figure3D({ figure }: { figure: Figure }) {
     spin.add(model);
     scene.add(spin, shadow(model));
 
-    // ドラッグで回す。離して2.5秒たつと、また正面でゆらゆら
-    let down = false, lx = 0, auto = true, timer = 0;
-    const onDown = (e: PointerEvent) => { down = true; lx = e.clientX; auto = false; canvas.setPointerCapture(e.pointerId); };
-    const onMove = (e: PointerEvent) => { if (down) { spin.rotation.y += (e.clientX - lx) * 0.012; lx = e.clientX; } };
+    // ドラッグで回す（左右＝模型を回す、上下＝見下ろす角度を変える）。離して2.5秒たつと、また正面でゆらゆら
+    const elev0 = camera.userData.elev as number;
+    let elev = elev0;
+    let down = false, lx = 0, ly = 0, auto = true, timer = 0;
+    const onDown = (e: PointerEvent) => { down = true; lx = e.clientX; ly = e.clientY; auto = false; canvas.setPointerCapture(e.pointerId); };
+    const onMove = (e: PointerEvent) => {
+      if (!down) return;
+      spin.rotation.y += (e.clientX - lx) * 0.012;
+      elev = clampElev(elev + (e.clientY - ly) * 0.01);
+      lx = e.clientX;
+      ly = e.clientY;
+    };
     const onUp = () => { down = false; clearTimeout(timer); timer = window.setTimeout(() => (auto = true), 2500); };
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
@@ -41,7 +49,11 @@ export default function Figure3D({ figure }: { figure: Figure }) {
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
       }
-      if (auto) spin.rotation.y += (Math.sin(t / 1700) * 0.5 - spin.rotation.y) * Math.min(1, dt * 2);
+      if (auto) {
+        spin.rotation.y += (Math.sin(t / 1700) * 0.5 - spin.rotation.y) * Math.min(1, dt * 2);
+        elev += (elev0 - elev) * Math.min(1, dt * 2);
+      }
+      orbit(camera, elev);
       model.position.y = y0 + Math.abs(Math.sin(t / 420)) * 0.06;
       renderer.render(scene, camera);
       raf = requestAnimationFrame(loop);
@@ -126,9 +138,21 @@ function makeCamera(model: THREE.Object3D, aspect: number) {
   const radius = size.length() / 2;
   const dist = (radius / Math.sin(((fov / 2) * Math.PI) / 180)) * 0.98;
   const cy = size.y * 0.45;
+  camera.userData = { elev, dist, cy };
+  orbit(camera, elev);
+  return camera;
+}
+
+// 見下ろす角度の範囲（下からのぞく〜真上の手前まで）
+const ELEV_MIN = (-25 * Math.PI) / 180;
+const ELEV_MAX = (80 * Math.PI) / 180;
+const clampElev = (e: number) => Math.max(ELEV_MIN, Math.min(ELEV_MAX, e));
+
+// orbit はカメラを、同じ距離のまま見下ろす角度 elev（ラジアン）の位置に置き直す。
+function orbit(camera: THREE.PerspectiveCamera, elev: number) {
+  const { dist, cy } = camera.userData as { dist: number; cy: number };
   camera.position.set(0, cy + dist * Math.sin(elev), dist * Math.cos(elev));
   camera.lookAt(0, cy, 0);
-  return camera;
 }
 
 // ===== 組み立て =====
