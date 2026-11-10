@@ -11,6 +11,8 @@ import {
   listItems,
   makeFigure,
   saveFigure,
+  getGarden,
+  saveGarden,
   shrinkImage,
   uploadImage,
   listMyItems,
@@ -29,7 +31,19 @@ import {
 } from "./api";
 import { useAuth } from "./auth";
 import ErrorBoundary from "./ErrorBoundary";
-import type { GardenEntry } from "./Garden3D";
+import type { GardenHandle } from "./Garden3D";
+import {
+  SKY_COLORS,
+  TAG_COLOR,
+  TAG_TEXT,
+  TIME_TEXT,
+  gardenLevel,
+  loadSeen,
+  saveSeen,
+  timeOfDayAt,
+  type GardenEntry,
+  type TimeOfDay,
+} from "./garden";
 import "./App.css";
 
 // 3D 模型の表示（three.js は大きいので、使うときだけ読み込む）
@@ -737,34 +751,98 @@ function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; 
   );
 }
 
-// ---- 箱庭（売った物・買った物の模型を1つの庭に並べる） ----
+// ---- 箱庭（売った物・買った物の模型を1つの島に並べる。数が増えると島が育つ） ----
+const TIME_MODES: ("now" | TimeOfDay)[] = ["now", "morning", "day", "evening", "night"];
+const VERB: Record<GardenEntry["tag"], string> = { sold: "売った", bought: "買った", selling: "出品した" };
+
 function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () => void }) {
-  const [data, setData] = useState<{ entries: GardenEntry[]; missing: Item[] } | null>(null);
+  const { state } = useAuth();
+  const myId = state.status === "ready" ? state.me.id : "";
+  const [data, setData] = useState<{ entries: GardenEntry[]; missing: Item[]; fresh: number } | null>(null);
   const [error, setError] = useState("");
+  const [timeMode, setTimeMode] = useState<"now" | TimeOfDay>("now");
+  const [selected, setSelected] = useState<string | null>(null);
+  const [shotMsg, setShotMsg] = useState("");
+  const [layoutMsg, setLayoutMsg] = useState("");
+  const handle = useRef<GardenHandle | null>(null);
+  const saveTimer = useRef(0);
+  const [nowTime] = useState<TimeOfDay>(() => timeOfDayAt(new Date())); // 開いたときの時間帯
 
   useEffect(() => {
-    Promise.all([listMyItems(), listMyPurchases()])
-      .then(([mine, bought]) => {
-        // 古い順に並べる（庭の奥から手前へ、思い出が積もっていく順）
+    if (!myId) return;
+    // 配置が読めなくても（表がまだ無いなど）箱庭は出す。そのときはマス目に並ぶ
+    Promise.all([listMyItems(), listMyPurchases(), getGarden().catch(() => [])])
+      .then(([mine, bought, spots]) => {
+        const spotOf = new Map(spots.map((s) => [s.item_id, { x: s.x, z: s.z }]));
+        // 古い順に並べる（思い出が積もっていく順）
         const all = [
-          ...mine.map((it) => ({ it, tag: (it.status === "sold" ? "sold" : "selling") as GardenEntry["tag"], at: it.created_at })),
-          ...bought.map((p) => ({ it: p.item, tag: "bought" as GardenEntry["tag"], at: p.created_at })),
+          ...mine.map((it) => ({ it, tag: (it.status === "sold" ? "sold" : "selling") as GardenEntry["tag"], at: it.created_at, price: it.price })),
+          ...bought.map((p) => ({ it: p.item, tag: "bought" as GardenEntry["tag"], at: p.created_at, price: p.price })),
         ].sort((a, b) => a.at.localeCompare(b.at));
+        const seen = loadSeen(myId);
         const entries: GardenEntry[] = [];
         const missing: Item[] = [];
-        const seen = new Set<string>();
-        for (const { it, tag } of all) {
-          if (seen.has(it.id)) continue;
-          seen.add(it.id);
-          if (it.figure) entries.push({ id: it.id, title: it.title, figure: it.figure, tag });
+        const ids = new Set<string>();
+        for (const { it, tag, at, price } of all) {
+          if (ids.has(it.id)) continue;
+          ids.add(it.id);
+          if (it.figure)
+            entries.push({ id: it.id, title: it.title, figure: it.figure, tag, at, price, isNew: seen !== null && !seen.has(it.id), spot: spotOf.get(it.id) });
           else missing.push(it);
         }
-        setData({ entries, missing });
+        saveSeen(myId, entries.map((e) => e.id));
+        setData({ entries, missing, fresh: entries.filter((e) => e.isNew).length });
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+  }, [myId]);
 
+  const time: TimeOfDay = timeMode === "now" ? nowTime : timeMode;
   const count = (tag: GardenEntry["tag"]) => data?.entries.filter((e) => e.tag === tag).length ?? 0;
+  const level = gardenLevel(data?.entries.length ?? 0);
+  const sel = data?.entries.find((e) => e.id === selected);
+  const [skyTop, skyBottom] = SKY_COLORS[time];
+
+  useEffect(() => () => clearTimeout(saveTimer.current), []);
+
+  // 動かした場所を覚え、少し待ってからまとめて保存する（続けて動かしても保存は1回）
+  function onMove(id: string, x: number, z: number) {
+    const e = data?.entries.find((x) => x.id === id);
+    if (e) e.spot = { x, z }; // 描き直し（時間帯の切り替えなど）でも、動かした場所に残す
+    setLayoutMsg("");
+    clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      const spots = (data?.entries ?? []).filter((e) => e.spot).map((e) => ({ item_id: e.id, x: e.spot!.x, z: e.spot!.z }));
+      saveGarden(spots)
+        .then(() => setLayoutMsg("配置を保存しました"))
+        .catch((err) => setLayoutMsg(err instanceof Error ? err.message : String(err)));
+    }, 700);
+  }
+
+  // 並べ直し：動かした場所を消して、マス目に戻す
+  function resetLayout() {
+    if (!data) return;
+    clearTimeout(saveTimer.current);
+    saveGarden([])
+      .then(() => {
+        setData({ ...data, entries: data.entries.map((e) => ({ ...e, spot: undefined })) });
+        setSelected(null);
+        setLayoutMsg("きれいに並べ直しました");
+      })
+      .catch((err) => setLayoutMsg(err instanceof Error ? err.message : String(err)));
+  }
+
+  function takePhoto() {
+    const url = handle.current?.snapshot();
+    if (!url) {
+      setShotMsg("この端末では撮影できませんでした");
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `hakoniwa-${new Date().toISOString().slice(0, 10)}.png`;
+    a.click();
+    setShotMsg("箱庭の画像を保存しました");
+  }
 
   return (
     <section>
@@ -776,17 +854,77 @@ function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () =
       {!data && !error && <p className="muted">読み込み中…</p>}
       {data && (
         <>
-          <p className="muted">
-            売った物 {count("sold")}・買った物 {count("bought")}・出品中 {count("selling")}。ドラッグで回して、模型をタップすると商品を開きます。
-          </p>
-          {data.entries.length > 0 ? (
-            <div className="garden-card">
-              <ErrorBoundary fallback={<p className="muted">箱庭を表示できませんでした</p>}>
-                <Suspense fallback={<p className="muted">箱庭を準備中…</p>}>
-                  <Garden3D entries={data.entries} onOpen={onOpen} />
-                </Suspense>
-              </ErrorBoundary>
+          <div className="garden-level">
+            <div className="garden-level-head">
+              <span className="garden-lv">Lv{level.lv}</span>
+              <b>{level.name}</b>
+              {data.fresh > 0 && <span className="garden-new">新しく {data.fresh} 個並びました</span>}
             </div>
+            <div className="garden-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(level.progress * 100)}>
+              <i style={{ width: `${Math.round(level.progress * 100)}%` }} />
+            </div>
+            <small className="muted">
+              {level.next
+                ? `あと ${level.toNext} 個で Lv${level.lv + 1}「${level.next.name}」（${level.next.unlock}が増えます）`
+                : "いちばん大きな島になりました"}
+              ・売った物 {count("sold")}・買った物 {count("bought")}・出品中 {count("selling")}
+            </small>
+          </div>
+
+          {data.entries.length > 0 ? (
+            <>
+              <div className="garden-tools">
+                <div className="chips" role="group" aria-label="時間帯">
+                  {TIME_MODES.map((m) => (
+                    <button key={m} className={timeMode === m ? "chip on" : "chip"} onClick={() => setTimeMode(m)}>
+                      {m === "now" ? `いま（${TIME_TEXT[nowTime]}）` : TIME_TEXT[m]}
+                    </button>
+                  ))}
+                </div>
+                <div className="chips">
+                  <button className="ghost small" onClick={resetLayout}>
+                    きれいに並べ直す
+                  </button>
+                  <button className="ghost small" onClick={takePhoto}>
+                    📸 記念撮影
+                  </button>
+                </div>
+              </div>
+              <div className="garden-card" style={{ background: `linear-gradient(${skyTop}, ${skyBottom})` }}>
+                <ErrorBoundary fallback={<p className="muted">箱庭を表示できませんでした</p>}>
+                  <Suspense fallback={<p className="muted">箱庭を準備中…</p>}>
+                    <Garden3D entries={data.entries} time={time} selectedId={selected} onSelect={setSelected} onMove={onMove} handleRef={handle} />
+                  </Suspense>
+                </ErrorBoundary>
+                {sel && (
+                  <div className="garden-info">
+                    <div className="garden-info-head">
+                      <span className="badge" style={{ background: TAG_COLOR[sel.tag], color: "#fff" }}>
+                        {TAG_TEXT[sel.tag]}
+                      </span>
+                      <b>{sel.title}</b>
+                    </div>
+                    {sel.figure.caption && <p>{sel.figure.caption}</p>}
+                    <p className="muted">
+                      {yen(sel.price)}・{new Date(sel.at).toLocaleDateString("ja-JP")} に{VERB[sel.tag]}
+                    </p>
+                    <div className="garden-info-actions">
+                      <button className="primary small" onClick={() => onOpen(sel.id)}>
+                        商品を見る
+                      </button>
+                      <button className="ghost small" onClick={() => setSelected(null)}>
+                        閉じる
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <p className="muted garden-help">
+                模型をつかんで好きな場所へ動かせます（自動で保存）。何もない所のドラッグで回す・上下で角度、ホイールか2本指でズーム。模型をタップすると紹介します。
+              </p>
+              {layoutMsg && <p className={layoutMsg.endsWith("しました") ? "ok" : "err"}>{layoutMsg}</p>}
+              {shotMsg && <p className="ok">{shotMsg}</p>}
+            </>
           ) : (
             <p className="garden-empty">
               まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
