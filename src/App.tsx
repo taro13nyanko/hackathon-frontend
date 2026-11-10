@@ -44,7 +44,7 @@ const yen = (n: number) => `¥${n.toLocaleString("ja-JP")}`;
 type View =
   | { kind: "list" }
   | { kind: "sell" }
-  | { kind: "detail"; id: string }
+  | { kind: "detail"; id: string; from?: "garden" } // from：戻るボタンの行き先（無ければ一覧）
   | { kind: "confirm"; item: Item }
   | { kind: "bought"; item: Item }
   | { kind: "mypage" }
@@ -111,7 +111,8 @@ export default function App() {
             {view.kind === "detail" && (
               <ItemDetail
                 id={view.id}
-                onBack={() => goList()}
+                backLabel={view.from === "garden" ? "← 箱庭へ" : "← 一覧へ"}
+                onBack={() => (view.from === "garden" ? setView({ kind: "garden" }) : goList())}
                 onBuy={(item) => setView({ kind: "confirm", item })}
                 onChat={(conv) => setView({ kind: "chat", conv })}
               />
@@ -139,7 +140,7 @@ export default function App() {
               />
             )}
             {view.kind === "garden" && (
-              <Garden onOpen={(id) => setView({ kind: "detail", id })} onBack={() => setView({ kind: "mypage" })} />
+              <Garden onOpen={(id) => setView({ kind: "detail", id, from: "garden" })} onBack={() => setView({ kind: "mypage" })} />
             )}
             {view.kind === "inbox" && <Inbox onOpen={(conv) => setView({ kind: "chat", conv })} />}
             {view.kind === "chat" && (
@@ -419,11 +420,13 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
 // ---- 商品詳細 ----
 function ItemDetail({
   id,
+  backLabel,
   onBack,
   onBuy,
   onChat,
 }: {
   id: string;
+  backLabel: string;
   onBack: () => void;
   onBuy: (item: Item) => void;
   onChat: (conv: Conversation) => void;
@@ -441,7 +444,7 @@ function ItemDetail({
   return (
     <section>
       <button className="ghost" onClick={onBack}>
-        ← 一覧へ
+        {backLabel}
       </button>
       {error && <p className="err">{error}</p>}
       {!item && !error && <p className="muted">読み込み中…</p>}
