@@ -55,14 +55,7 @@ export default function Figure3D({ figure }: { figure: Figure }) {
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("pointercancel", onUp);
-      scene.traverse((o) => {
-        if (o instanceof THREE.Mesh) {
-          o.geometry.dispose();
-          const m = o.material as THREE.Material & { map?: THREE.Texture | null };
-          m.map?.dispose();
-          m.dispose();
-        }
-      });
+      disposeScene(scene);
       renderer.dispose();
     };
   }, [figure]);
@@ -93,19 +86,26 @@ export function renderSnapshot(figure: Figure, size = 448): string {
     renderer.render(scene, camera);
   });
   const url = canvas.toDataURL("image/jpeg", 0.9);
-  scene.traverse((o) => {
-    if (o instanceof THREE.Mesh) {
-      o.geometry.dispose();
-      const m = o.material as THREE.Material & { map?: THREE.Texture | null };
-      m.map?.dispose();
-      m.dispose();
-    }
-  });
+  disposeScene(scene);
   renderer.dispose();
   return url;
 }
 
-function addLights(scene: THREE.Scene) {
+// disposeScene は場面の形・材質・貼った絵を片付ける（GPU のメモリを返す）。
+export function disposeScene(scene: THREE.Object3D) {
+  scene.traverse((o) => {
+    if (o instanceof THREE.Mesh || o instanceof THREE.Sprite) {
+      o.geometry.dispose();
+      const mats = (Array.isArray(o.material) ? o.material : [o.material]) as (THREE.Material & { map?: THREE.Texture | null })[];
+      for (const m of mats) {
+        m.map?.dispose();
+        m.dispose();
+      }
+    }
+  });
+}
+
+export function addLights(scene: THREE.Scene) {
   scene.add(new THREE.HemisphereLight(0xffffff, 0xe8d6bf, 1.3));
   const sun = new THREE.DirectionalLight(0xffffff, 1.9);
   sun.position.set(-3, 5, 4);
@@ -204,7 +204,7 @@ function labelMesh(p: FigurePart) {
   return new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
 }
 
-function build(f: Figure) {
+export function build(f: Figure) {
   const g = new THREE.Group();
   const meshes: THREE.Mesh[] = [];
   for (const p of f.parts) {
@@ -296,7 +296,7 @@ function addFace(group: THREE.Group, f: Figure, meshes: THREE.Mesh[]) {
   }
 }
 
-function shadow(model: THREE.Object3D) {
+export function shadow(model: THREE.Object3D) {
   const size = (model.userData.size as THREE.Vector3) ?? new THREE.Vector3(2.2, 2.2, 2.2);
   const r = Math.max(size.x, size.z) * 1.25;
   const c = document.createElement("canvas");
