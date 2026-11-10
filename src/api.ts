@@ -4,35 +4,6 @@ import { auth } from "./firebase";
 // 例: https://hackathon-backend-xxxxxxxx-uc.a.run.app （末尾の / は不要）
 const API_URL = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
-export type User = { id: string; name: string; age: number };
-
-export async function listUsers(): Promise<User[]> {
-  const res = await fetch(`${API_URL}/users`);
-  if (!res.ok) throw new Error(`一覧の取得に失敗しました (HTTP ${res.status})`);
-  return res.json();
-}
-
-export async function searchUsers(name: string): Promise<User[]> {
-  const res = await fetch(`${API_URL}/user?name=${encodeURIComponent(name)}`);
-  if (!res.ok) throw new Error(`検索に失敗しました (HTTP ${res.status})`);
-  return res.json();
-}
-
-export async function createUser(name: string, age: number): Promise<string> {
-  const res = await fetch(`${API_URL}/user`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, age }),
-  });
-  if (res.status === 400) throw new Error("名前は1〜50文字、年齢は20〜80で入力してください");
-  if (!res.ok) throw new Error(`登録に失敗しました (HTTP ${res.status})`);
-  const data: { id: string } = await res.json();
-  return data.id;
-}
-
-// ---- ログイン ----
-
-// ApiError はバックエンドの {"error": "<コード>"} を持ったエラー。
 export class ApiError extends Error {
   status: number;
   code: string;
