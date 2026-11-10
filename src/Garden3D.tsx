@@ -67,26 +67,34 @@ export default function Garden3D({ entries, onOpen }: { entries: GardenEntry[]; 
 
     // カメラ：庭全体が収まるよう、斜め上から
     const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 200);
-    const placeCamera = (aspect: number) => {
-      const fit = (reach * 1.05) / Math.tan(((34 / 2) * Math.PI) / 180) / Math.min(1, aspect);
-      const elev = (38 * Math.PI) / 180;
+    // 見下ろす角度 elev は上下のドラッグで変わる（真横に近い 8° 〜 ほぼ真上の 85°）
+    const ELEV_MIN = (8 * Math.PI) / 180, ELEV_MAX = (85 * Math.PI) / 180;
+    let elev = (38 * Math.PI) / 180;
+    let fit = 10;
+    const placeCamera = () => {
       camera.position.set(0, fit * Math.sin(elev) + 0.6, fit * Math.cos(elev));
       camera.lookAt(0, 0.4, 0);
     };
+    const fitTo = (aspect: number) => {
+      fit = (reach * 1.05) / Math.tan(((34 / 2) * Math.PI) / 180) / Math.min(1, aspect);
+    };
 
     // ドラッグで回す／ほとんど動かさずに離したらタップ（その模型の商品を開く）
-    let down = false, lx = 0, moved = 0, sx = 0, sy = 0, vel = 0;
+    let down = false, lx = 0, ly = 0, moved = 0, sx = 0, sy = 0, vel = 0;
     const ray = new THREE.Raycaster();
     const onDown = (e: PointerEvent) => {
-      down = true; lx = sx = e.clientX; sy = e.clientY; moved = 0; vel = 0;
+      down = true; lx = sx = e.clientX; ly = sy = e.clientY; moved = 0; vel = 0;
       canvas.setPointerCapture(e.pointerId);
     };
     const onMove = (e: PointerEvent) => {
       if (!down) return;
-      const dx = e.clientX - lx;
+      const dx = e.clientX - lx, dy = e.clientY - ly;
       lx = e.clientX;
+      ly = e.clientY;
       garden.rotation.y += dx * 0.008;
       vel = dx * 0.008;
+      elev = Math.max(ELEV_MIN, Math.min(ELEV_MAX, elev + dy * 0.006));
+      placeCamera();
       moved = Math.max(moved, Math.hypot(e.clientX - sx, e.clientY - sy));
     };
     const onUp = (e: PointerEvent) => {
@@ -113,7 +121,8 @@ export default function Garden3D({ entries, onOpen }: { entries: GardenEntry[]; 
       if (canvas.width !== Math.floor(w * renderer.getPixelRatio()) || canvas.height !== Math.floor(h * renderer.getPixelRatio())) {
         renderer.setSize(w, h, false);
         camera.aspect = w / h;
-        placeCamera(camera.aspect);
+        fitTo(camera.aspect);
+        placeCamera();
         camera.updateProjectionMatrix();
       }
       if (!down) {
