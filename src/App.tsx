@@ -765,7 +765,12 @@ function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () =
   const [shotMsg, setShotMsg] = useState("");
   const [layoutMsg, setLayoutMsg] = useState("");
   const handle = useRef<GardenHandle | null>(null);
+  // 配置の保存：最新の並びを ref に持ち、保存は1本ずつ順番に送る（並べ直しと重なっても、押した順に届く）
+  const entriesRef = useRef<GardenEntry[]>([]);
   const saveTimer = useRef(0);
+  const dirty = useRef(false);
+  const saving = useRef<Promise<void>>(Promise.resolve());
+  const mounted = useRef(true);
   const [nowTime] = useState<TimeOfDay>(() => timeOfDayAt(new Date())); // 開いたときの時間帯
 
   useEffect(() => {
@@ -791,6 +796,7 @@ function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () =
           else missing.push(it);
         }
         saveSeen(myId, entries.map((e) => e.id));
+        entriesRef.current = entries;
         setData({ entries, missing, fresh: entries.filter((e) => e.isNew).length });
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
@@ -802,33 +808,61 @@ function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () =
   const sel = data?.entries.find((e) => e.id === selected);
   const [skyTop, skyBottom] = SKY_COLORS[time];
 
-  useEffect(() => () => clearTimeout(saveTimer.current), []);
+  const say = (msg: string) => {
+    if (mounted.current) setLayoutMsg(msg);
+  };
+  // 保存を列の最後に積む（前の保存が終わってから送る）
+  const enqueueSave = (spots: { item_id: string; x: number; z: number }[], done: string) => {
+    saving.current = saving.current
+      .then(() => saveGarden(spots))
+      .then(() => say(done))
+      .catch((err) => say(err instanceof Error ? err.message : String(err)));
+  };
+  // まだ送っていない移動があれば、すぐ保存する
+  const flush = () => {
+    clearTimeout(saveTimer.current);
+    if (!dirty.current) return;
+    dirty.current = false;
+    const spots = entriesRef.current.filter((e) => e.spot).map((e) => ({ item_id: e.id, x: e.spot!.x, z: e.spot!.z }));
+    enqueueSave(spots, "配置を保存しました");
+  };
+  const flushRef = useRef(flush);
+  useEffect(() => {
+    flushRef.current = flush;
+  });
+  // 画面を離れるとき・タブを隠したときも、動かした直後の分を送る
+  useEffect(() => {
+    mounted.current = true;
+    const onHide = () => flushRef.current();
+    window.addEventListener("pagehide", onHide);
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      document.removeEventListener("visibilitychange", onHide);
+      flushRef.current();
+      mounted.current = false;
+    };
+  }, []);
 
   // 動かした場所を覚え、少し待ってからまとめて保存する（続けて動かしても保存は1回）
   function onMove(id: string, x: number, z: number) {
-    const e = data?.entries.find((x) => x.id === id);
+    const e = entriesRef.current.find((x) => x.id === id);
     if (e) e.spot = { x, z }; // 描き直し（時間帯の切り替えなど）でも、動かした場所に残す
+    dirty.current = true;
     setLayoutMsg("");
     clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => {
-      const spots = (data?.entries ?? []).filter((e) => e.spot).map((e) => ({ item_id: e.id, x: e.spot!.x, z: e.spot!.z }));
-      saveGarden(spots)
-        .then(() => setLayoutMsg("配置を保存しました"))
-        .catch((err) => setLayoutMsg(err instanceof Error ? err.message : String(err)));
-    }, 700);
+    saveTimer.current = window.setTimeout(flush, 700);
   }
 
   // 並べ直し：動かした場所を消して、マス目に戻す
   function resetLayout() {
-    if (!data) return;
     clearTimeout(saveTimer.current);
-    saveGarden([])
-      .then(() => {
-        setData({ ...data, entries: data.entries.map((e) => ({ ...e, spot: undefined })) });
-        setSelected(null);
-        setLayoutMsg("きれいに並べ直しました");
-      })
-      .catch((err) => setLayoutMsg(err instanceof Error ? err.message : String(err)));
+    dirty.current = false;
+    const fresh = entriesRef.current.map((e) => ({ ...e, spot: undefined }));
+    entriesRef.current = fresh;
+    setData((d) => (d ? { ...d, entries: fresh } : d));
+    setSelected(null);
+    enqueueSave([], "きれいに並べ直しました");
   }
 
   function takePhoto() {

@@ -56,17 +56,48 @@ export default function Garden3D({ entries, time, selectedId, onSelect, onMove, 
     const n = entries.length;
     const cols = Math.ceil(Math.sqrt(n));
     const rows = Math.ceil(n / cols);
-    const slots = entries.map((e, i) => {
-      if (e.spot && Number.isFinite(e.spot.x) && Number.isFinite(e.spot.z)) return new THREE.Vector2(e.spot.x, e.spot.z);
+    const grid = (i: number) => {
       const r = Math.floor(i / cols);
       const inRow = r === rows - 1 ? n - r * cols : cols;
       const c = i % cols;
       return new THREE.Vector2((c - (inRow - 1) / 2) * GAP, (r - (rows - 1) / 2) * GAP);
-    });
-    const reach = Math.max(GAP * 0.6, ...slots.map((p) => p.length())) + GAP * 0.7;
+    };
+    // 島の大きさは、マス目の並びとレベルだけで決める（動かした場所に合わせると、描き直すたびに広がってしまう）
+    const reach = Math.max(GAP * 0.6, ...entries.map((_, i) => grid(i).length())) + GAP * 0.7;
     const radius = Math.min(14, reach + 0.6 + level.lv * 0.25); // レベルが上がると島が広がる
     const roam = radius - 0.75; // 模型を置ける範囲（島の中心からの距離）
-    for (const p of slots) if (p.length() > roam) p.setLength(roam);
+    const MIN_APART = 1.15; // 模型どうしの間をこれだけあける
+
+    // 動かした模型は、その場所（島からはみ出していたら島の中へ）
+    const slots: THREE.Vector2[] = new Array(n);
+    const placed: THREE.Vector2[] = [];
+    entries.forEach((e, i) => {
+      if (!e.spot || !Number.isFinite(e.spot.x) || !Number.isFinite(e.spot.z)) return;
+      const p = new THREE.Vector2(e.spot.x, e.spot.z);
+      if (p.length() > roam) p.setLength(roam);
+      slots[i] = p;
+      placed.push(p);
+    });
+    // 動かしていない模型はマス目へ。ふさがっていたら（模型が増えてマス目がずれたときなど）、中心に近い空き場所へ
+    const free: THREE.Vector2[] = [];
+    const step = GAP * 0.65;
+    for (let gx = -12; gx <= 12; gx++)
+      for (let gz = -12; gz <= 12; gz++) {
+        const p = new THREE.Vector2(gx * step, gz * step);
+        if (p.length() <= roam) free.push(p);
+      }
+    free.sort((a, b) => a.length() - b.length());
+    entries.forEach((_, i) => {
+      if (slots[i]) return;
+      let p = grid(i);
+      if (p.length() > roam) p.setLength(roam);
+      if (placed.some((q) => q.distanceTo(p) < MIN_APART)) {
+        const spare = free.find((c) => placed.every((q) => q.distanceTo(c) >= MIN_APART));
+        if (spare) p = spare.clone();
+      }
+      slots[i] = p;
+      placed.push(p);
+    });
 
     // ---- 空・光・島 ----
     addLights(scene, time);
@@ -227,7 +258,7 @@ export default function Garden3D({ entries, time, selectedId, onSelect, onMove, 
           if (o === fig) continue;
           const q = new THREE.Vector2(o.base.position.x, o.base.position.z);
           const d = p.distanceTo(q);
-          if (d < 1.15) p.copy(q).add((d > 1e-3 ? p.clone().sub(q) : new THREE.Vector2(1, 0)).setLength(1.15));
+          if (d < MIN_APART) p.copy(q).add((d > 1e-3 ? p.clone().sub(q) : new THREE.Vector2(1, 0)).setLength(MIN_APART));
         }
         if (p.length() > roam) p.setLength(roam);
       }
@@ -302,9 +333,20 @@ export default function Garden3D({ entries, time, selectedId, onSelect, onMove, 
       if (pointers.size > 0 || e.pointerType !== "mouse") return;
       canvas.style.cursor = pick(e.clientX, e.clientY) ? "grab" : "";
     };
+    // 2本指のあと1本指に戻ったら、残った指の位置から数え直す（回転が跳ばないように）
+    const restart = () => {
+      if (pointers.size !== 1) return;
+      const [p] = [...pointers.values()];
+      lx = sx = p.x;
+      ly = sy = p.y;
+      vel = 0;
+      moved = 99; // タップにはしない
+      pinch = 0;
+    };
     const onUp = (e: PointerEvent) => {
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
+      restart();
       if (grab?.dragging) {
         drop();
         return;
@@ -316,6 +358,7 @@ export default function Garden3D({ entries, time, selectedId, onSelect, onMove, 
     };
     const onCancel = (e: PointerEvent) => {
       pointers.delete(e.pointerId);
+      restart();
       drop();
     };
     const onWheel = (e: WheelEvent) => {
@@ -498,8 +541,8 @@ function sky(time: TimeOfDay, r: number, tickers: Ticker[]): THREE.Object3D[] {
       c.add(s);
     }
     const a = (i / 6) * Math.PI * 2;
-    c.position.set(Math.cos(a) * (r + 3.2), 2.4 + (i % 3) * 0.6, Math.sin(a) * (r + 3.2));
-    c.scale.setScalar(0.4 + (i % 3) * 0.1);
+    c.position.set(Math.cos(a) * (r + 7), 3.6 + (i % 3) * 0.8, Math.sin(a) * (r + 7));
+    c.scale.setScalar(0.7 + (i % 3) * 0.15);
     clouds.add(c);
   }
   tickers.push((_t, dt) => (clouds.rotation.y += dt * 0.02));
