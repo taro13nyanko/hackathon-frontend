@@ -89,7 +89,8 @@ input, textarea {
   width: 100%; display: grid; grid-template-columns: 48px 1fr auto auto; gap: 12px; align-items: center;
   background: none; padding: 8px 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left;
 }
-.thumb.small { width: 48px; font-size: 1.2rem; border-radius: 6px; }
+/* ボタン用の .small（余白つき）と名前がぶつかるので、サムネイルでは余白を消して 48px 角にそろえる */
+.thumb.small { width: 48px; height: 48px; padding: 0; box-sizing: border-box; font-size: 1.2rem; border-radius: 6px; }
 .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #e0f2fe; color: #075985; white-space: nowrap; }
 .sold-badge { background: #fee2e2; color: #991b1b; }
 
