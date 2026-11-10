@@ -319,3 +319,25 @@ export async function saveFigure(itemId: string, figure: Figure): Promise<Figure
   };
   throw new ApiError(messages[code] ?? `模型の保存に失敗しました (HTTP ${res.status})`, res.status, code);
 }
+
+// ---- 箱庭の配置（模型をつかんで動かした場所） ----
+export type GardenSpot = { item_id: string; x: number; z: number };
+
+export async function getGarden(): Promise<GardenSpot[]> {
+  const res = await authFetch("/me/garden");
+  if (!res.ok) throw new ApiError(`箱庭の配置を読めませんでした (HTTP ${res.status})`, res.status, await errorCode(res));
+  return ((await res.json()) as { spots: GardenSpot[] }).spots ?? [];
+}
+
+// saveGarden は配置をまとめて保存する（前の配置は消える。空なら並べ直し）。
+export async function saveGarden(spots: GardenSpot[]): Promise<void> {
+  const res = await authFetch("/me/garden", { method: "PUT", body: JSON.stringify({ spots }) });
+  if (res.ok) return;
+  const code = await errorCode(res);
+  const messages: Record<string, string> = {
+    too_many: "動かしすぎです。少し待ってから、もう一度動かしてください",
+    forbidden: "この模型の場所は保存できません",
+    unauthorized: "ログインし直してください",
+  };
+  throw new ApiError(messages[code] ?? `配置を保存できませんでした (HTTP ${res.status})`, res.status, code);
+}

@@ -150,7 +150,24 @@ img.thumb.large { max-width: 360px; }
 /* 模型の保存・箱庭 */
 .figure-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .figure-badge { background: #fff3d6; }
-.garden-card { width: 100%; background: linear-gradient(#dff1ff, #fff8ef); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.garden-card { position: relative; width: 100%; background: linear-gradient(#dff1ff, #fff8ef); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; transition: background 0.6s; }
 .garden3d { display: block; width: 100%; aspect-ratio: 4 / 3; cursor: grab; touch-action: none; }
 .garden-empty { padding: 24px; background: #fff8ef; border: 1px dashed var(--line); border-radius: 16px; }
 @media (max-width: 600px) { .garden3d { aspect-ratio: 1; } }
+
+/* 箱庭：レベル・道具・紹介カード */
+.garden-level { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 12px; padding: 12px 14px; background: #fff8ef; border: 1px solid var(--line); border-radius: 14px; }
+.garden-level-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.garden-lv { background: #5fb35a; color: #fff; font-weight: 800; border-radius: 999px; padding: 2px 10px; font-size: 0.9rem; }
+.garden-new { background: #ff5a5f; color: #fff; border-radius: 999px; padding: 2px 10px; font-size: 0.8rem; font-weight: 700; }
+.garden-bar { height: 10px; background: #eadfce; border-radius: 999px; overflow: hidden; }
+.garden-bar i { display: block; height: 100%; background: linear-gradient(90deg, #8fd16a, #5fb35a); border-radius: 999px; transition: width 0.6s; }
+.garden-tools { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 4px 12px; font-size: 0.85rem; cursor: pointer; }
+.chip.on { background: #3a2f28; color: #fff; border-color: #3a2f28; }
+.garden-info { position: absolute; left: 12px; right: 12px; bottom: 12px; max-width: 420px; background: rgba(255, 255, 255, 0.96); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; box-shadow: 0 6px 24px rgba(58, 47, 40, 0.18); display: flex; flex-direction: column; gap: 6px; }
+.garden-info p { margin: 0; }
+.garden-info-head { display: flex; align-items: center; gap: 8px; }
+.garden-info-actions { display: flex; gap: 8px; }
+.garden-help { font-size: 0.85rem; margin-top: 6px; }
