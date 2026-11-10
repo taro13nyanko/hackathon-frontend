@@ -10,6 +10,7 @@ import {
   imageUrl,
   listItems,
   makeFigure,
+  saveFigure,
   shrinkImage,
   uploadImage,
   listMyItems,
@@ -27,26 +28,29 @@ import {
   type Purchase,
 } from "./api";
 import { useAuth } from "./auth";
+import type { GardenEntry } from "./Garden3D";
 import "./App.css";
 
 // 3D 模型の表示（three.js は大きいので、使うときだけ読み込む）
 const Figure3D = lazy(() => import("./Figure3D"));
+const Garden3D = lazy(() => import("./Garden3D"));
 
 const yen = (n: number) => `¥${n.toLocaleString("ja-JP")}`;
 
 // 画面：一覧（list）／出品（sell）／詳細（detail）／購入確認（confirm）／購入完了（bought）／マイページ（mypage）
-//       ／メッセージ一覧（inbox）／メッセージ（chat）。
+//       ／メッセージ一覧（inbox）／メッセージ（chat）／箱庭（garden：売った物・買った物の模型を並べる）。
 // ログインして表示名が未登録のときは、どの画面よりも先にプロフィール登録を出す。
 // ページ遷移のライブラリ（React Router）はまだ入れていない。
 type View =
   | { kind: "list" }
   | { kind: "sell" }
-  | { kind: "detail"; id: string }
+  | { kind: "detail"; id: string; from?: "garden" } // from：戻るボタンの行き先（無ければ一覧）
   | { kind: "confirm"; item: Item }
   | { kind: "bought"; item: Item }
   | { kind: "mypage" }
   | { kind: "inbox" }
-  | { kind: "chat"; conv: Conversation };
+  | { kind: "chat"; conv: Conversation }
+  | { kind: "garden" };
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "list" });
@@ -107,7 +111,8 @@ export default function App() {
             {view.kind === "detail" && (
               <ItemDetail
                 id={view.id}
-                onBack={() => goList()}
+                backLabel={view.from === "garden" ? "← 箱庭へ" : "← 一覧へ"}
+                onBack={() => (view.from === "garden" ? setView({ kind: "garden" }) : goList())}
                 onBuy={(item) => setView({ kind: "confirm", item })}
                 onChat={(conv) => setView({ kind: "chat", conv })}
               />
@@ -128,7 +133,14 @@ export default function App() {
               />
             )}
             {view.kind === "mypage" && (
-              <MyPage onOpen={(id) => setView({ kind: "detail", id })} onLogout={() => { logout(); goList(); }} />
+              <MyPage
+                onOpen={(id) => setView({ kind: "detail", id })}
+                onGarden={() => setView({ kind: "garden" })}
+                onLogout={() => { logout(); goList(); }}
+              />
+            )}
+            {view.kind === "garden" && (
+              <Garden onOpen={(id) => setView({ kind: "detail", id, from: "garden" })} onBack={() => setView({ kind: "mypage" })} />
             )}
             {view.kind === "inbox" && <Inbox onOpen={(conv) => setView({ kind: "chat", conv })} />}
             {view.kind === "chat" && (
@@ -408,11 +420,13 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
 // ---- 商品詳細 ----
 function ItemDetail({
   id,
+  backLabel,
   onBack,
   onBuy,
   onChat,
 }: {
   id: string;
+  backLabel: string;
   onBack: () => void;
   onBuy: (item: Item) => void;
   onChat: (conv: Conversation) => void;
@@ -430,7 +444,7 @@ function ItemDetail({
   return (
     <section>
       <button className="ghost" onClick={onBack}>
-        ← 一覧へ
+        {backLabel}
       </button>
       {error && <p className="err">{error}</p>}
       {!item && !error && <p className="muted">読み込み中…</p>}
@@ -440,7 +454,13 @@ function ItemDetail({
           {item.figure_image_id && item.photo_image_id && (
             <img className="photo" src={imageUrl(item.photo_image_id)} alt={`${item.title}の写真`} loading="lazy" />
           )}
-          {item.photo_image_id && <FigureMaker item={item} canMake={state.status === "ready"} />}
+          {(item.photo_image_id || item.figure) && (
+            <FigureMaker
+              item={item}
+              myId={state.status === "ready" ? state.me.id : null}
+              onSaved={(figure) => setItem({ ...item, figure, figure_caption: figure.caption })}
+            />
+          )}
           <h1>{item.title}</h1>
           <p className="price big">{yen(item.price)}</p>
           <p className="status">{item.status === "on_sale" ? "出品中" : "売り切れ"}</p>
@@ -475,19 +495,30 @@ function ItemDetail({
 }
 
 // ---- 3D 模型（写真から Gemini が部品を決め、画面で組み立てる） ----
-function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
-  const [figure, setFigure] = useState<Figure | null>(null);
+// 保存した模型は商品に載り、箱庭に並ぶ。保存できるのは出品者（いつでも上書き）と購入者（模型がまだ無いときだけ）。
+function FigureMaker({ item, myId, onSaved }: { item: Item; myId: string | null; onSaved: (figure: Figure) => void }) {
+  const [figure, setFigure] = useState<Figure | null>(item.figure);
+  const [unsaved, setUnsaved] = useState(false); // 作ったがまだ保存していない
   const [phase, setPhase] = useState<"" | "draft" | "refine">("");
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [savedMsg, setSavedMsg] = useState("");
+
+  const isSeller = myId !== null && item.seller?.id === myId;
+  // 購入者かどうかは商品の情報からは分からないので、売り切れの商品ならボタンを出し、だめならサーバーの答え（403）を見せる
+  const canSave = myId !== null && (isSeller || (item.status === "sold" && !item.figure));
+  const canMake = myId !== null && item.photo_image_id !== "" && (isSeller || !item.figure);
 
   // 2段階でつくる：① 写真から下書き → ② 下書きを描いた画像と写真を見比べて仕上げ（下書きは先に見せておく）
   async function make() {
     setError("");
+    setSavedMsg("");
     setPhase("draft");
     let draft: Figure;
     try {
       draft = await makeFigure(item.photo_image_id, item.title);
       setFigure(draft);
+      setUnsaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setPhase("");
@@ -506,7 +537,24 @@ function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
     }
   }
 
-  const busy = phase !== "";
+  async function save() {
+    if (!figure) return;
+    setError("");
+    setSaving(true);
+    try {
+      const saved = await saveFigure(item.id, figure);
+      setFigure(saved);
+      setUnsaved(false);
+      setSavedMsg("保存しました。マイページの「箱庭」に並びます");
+      onSaved(saved);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const busy = phase !== "" || saving;
   return (
     <div className="figure-maker">
       {figure && (
@@ -516,23 +564,39 @@ function FigureMaker({ item, canMake }: { item: Item; canMake: boolean }) {
           </Suspense>
           <figcaption>
             <b>{figure.name}</b> {figure.caption}
-            <small>{phase === "refine" ? "下書きです。AI が写真と見比べて仕上げています…" : "ドラッグで回せます"}</small>
+            <small>
+              {phase === "refine"
+                ? "下書きです。AI が写真と見比べて仕上げています…"
+                : unsaved
+                  ? "ドラッグで回せます（まだ保存していません）"
+                  : "ドラッグで回せます"}
+            </small>
           </figcaption>
         </figure>
       )}
-      {canMake ? (
-        <button className="ghost" onClick={make} disabled={busy}>
-          {phase === "draft"
-            ? "AI が写真をよく見て下書き中…（1分ほど）"
-            : phase === "refine"
-              ? "写真と見比べて仕上げ中…（もう1分ほど）"
-              : figure
-                ? "もう一度つくる"
-                : "✨ 写真から3D模型をつくる"}
-        </button>
-      ) : (
-        <p className="muted">ログインすると、写真から3D模型をつくれます</p>
+      <div className="figure-actions">
+        {canMake && (
+          <button className="ghost" onClick={make} disabled={busy}>
+            {phase === "draft"
+              ? "AI が写真をよく見て下書き中…（1分ほど）"
+              : phase === "refine"
+                ? "写真と見比べて仕上げ中…（もう1分ほど）"
+                : figure
+                  ? "もう一度つくる"
+                  : "✨ 写真から3D模型をつくる"}
+          </button>
+        )}
+        {figure && unsaved && canSave && (
+          <button className="primary" onClick={save} disabled={busy}>
+            {saving ? "保存中…" : "この模型を保存して箱庭に飾る"}
+          </button>
+        )}
+      </div>
+      {myId === null && item.photo_image_id && !figure && <p className="muted">ログインすると、写真から3D模型をつくれます</p>}
+      {figure && unsaved && !canSave && myId !== null && phase === "" && (
+        <p className="muted">模型を保存できるのは、出品した人と購入した人だけです</p>
       )}
+      {savedMsg && <p className="ok">{savedMsg}</p>}
       {error && <p className="err">{error}</p>}
     </div>
   );
@@ -614,7 +678,7 @@ function Bought({
 }
 
 // ---- マイページ（出品した商品・購入した商品） ----
-function MyPage({ onOpen, onLogout }: { onOpen: (id: string) => void; onLogout: () => void }) {
+function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; onGarden: () => void; onLogout: () => void }) {
   const [tab, setTab] = useState<"selling" | "bought">("selling");
   const [mine, setMine] = useState<Item[] | null>(null);
   const [bought, setBought] = useState<Purchase[] | null>(null);
@@ -635,6 +699,9 @@ function MyPage({ onOpen, onLogout }: { onOpen: (id: string) => void; onLogout: 
     <section>
       <div className="mypage-head">
         <h1>マイページ</h1>
+        <button className="primary small" onClick={onGarden}>
+          🌱 箱庭を見る
+        </button>
         <button className="ghost small" onClick={onLogout}>
           ログアウト
         </button>
@@ -657,11 +724,87 @@ function MyPage({ onOpen, onLogout }: { onOpen: (id: string) => void; onLogout: 
               <Thumb item={it} className="thumb small" />
               <span className="title">{it.title}</span>
               <span className="price">{yen(it.price)}</span>
+              {it.figure && <span className="badge figure-badge" title="模型あり">🧸</span>}
               {tab === "selling" && <span className={it.status === "sold" ? "badge sold-badge" : "badge"}>{it.status === "sold" ? "売れました" : "出品中"}</span>}
             </button>
           </li>
         ))}
       </ul>
+    </section>
+  );
+}
+
+// ---- 箱庭（売った物・買った物の模型を1つの庭に並べる） ----
+function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () => void }) {
+  const [data, setData] = useState<{ entries: GardenEntry[]; missing: Item[] } | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    Promise.all([listMyItems(), listMyPurchases()])
+      .then(([mine, bought]) => {
+        // 古い順に並べる（庭の奥から手前へ、思い出が積もっていく順）
+        const all = [
+          ...mine.map((it) => ({ it, tag: (it.status === "sold" ? "sold" : "selling") as GardenEntry["tag"], at: it.created_at })),
+          ...bought.map((p) => ({ it: p.item, tag: "bought" as GardenEntry["tag"], at: p.created_at })),
+        ].sort((a, b) => a.at.localeCompare(b.at));
+        const entries: GardenEntry[] = [];
+        const missing: Item[] = [];
+        const seen = new Set<string>();
+        for (const { it, tag } of all) {
+          if (seen.has(it.id)) continue;
+          seen.add(it.id);
+          if (it.figure) entries.push({ id: it.id, title: it.title, figure: it.figure, tag });
+          else missing.push(it);
+        }
+        setData({ entries, missing });
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  const count = (tag: GardenEntry["tag"]) => data?.entries.filter((e) => e.tag === tag).length ?? 0;
+
+  return (
+    <section>
+      <button className="ghost" onClick={onBack}>
+        ← マイページへ
+      </button>
+      <h1>箱庭</h1>
+      {error && <p className="err">{error}</p>}
+      {!data && !error && <p className="muted">読み込み中…</p>}
+      {data && (
+        <>
+          <p className="muted">
+            売った物 {count("sold")}・買った物 {count("bought")}・出品中 {count("selling")}。ドラッグで回して、模型をタップすると商品を開きます。
+          </p>
+          {data.entries.length > 0 ? (
+            <div className="garden-card">
+              <Suspense fallback={<p className="muted">箱庭を準備中…</p>}>
+                <Garden3D entries={data.entries} onOpen={onOpen} />
+              </Suspense>
+            </div>
+          ) : (
+            <p className="garden-empty">
+              まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
+            </p>
+          )}
+          {data.missing.length > 0 && (
+            <>
+              <h2>模型がまだの商品</h2>
+              <ul className="rows">
+                {data.missing.map((it) => (
+                  <li key={it.id}>
+                    <button className="row" onClick={() => onOpen(it.id)}>
+                      <Thumb item={it} className="thumb small" />
+                      <span className="title">{it.title}</span>
+                      <span className="muted">{it.photo_image_id ? "開いて模型をつくる" : "写真がないので模型はつくれません"}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
+      )}
     </section>
   );
 }

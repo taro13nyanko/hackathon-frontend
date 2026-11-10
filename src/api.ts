@@ -95,6 +95,7 @@ export type Item = {
   photo_image_id: string; // 無ければ ""
   figure_image_id: string;
   figure_caption: string;
+  figure: Figure | null; // 保存された 3D 模型の設計図（無ければ null）。箱庭に並ぶ
   created_at: string; // ISO 8601
 };
 export type ItemInput = { title: string; description: string; price: number; photo_image_id?: string };
@@ -317,4 +318,21 @@ export async function makeFigure(
     unauthorized: "ログインしてください",
   };
   throw new ApiError(messages[code] ?? `模型の作成に失敗しました (HTTP ${res.status})`, res.status, code);
+}
+
+// saveFigure は模型を商品に保存する（箱庭に並ぶ）。出品者はいつでも上書きでき、購入者は模型がまだ無いときだけ。
+// サーバーが範囲内に直した設計図が返る。
+export async function saveFigure(itemId: string, figure: Figure): Promise<Figure> {
+  const res = await authFetch(`/items/${encodeURIComponent(itemId)}/figure`, { method: "PUT", body: JSON.stringify({ figure }) });
+  if (res.ok) return ((await res.json()) as { figure: Figure }).figure;
+  const code = await errorCode(res);
+  const messages: Record<string, string> = {
+    forbidden: "模型を保存できるのは、出品した人と購入した人だけです",
+    figure_exists: "この商品には出品者の模型が保存されています",
+    not_found: "商品が見つかりません",
+    invalid_input: "この模型は保存できませんでした。作り直してください",
+    profile_required: "表示名を登録してください",
+    unauthorized: "ログインしてください",
+  };
+  throw new ApiError(messages[code] ?? `模型の保存に失敗しました (HTTP ${res.status})`, res.status, code);
 }

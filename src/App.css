@@ -146,3 +146,11 @@ img.thumb.large { max-width: 360px; }
 .figure3d { display: block; width: 100%; aspect-ratio: 1; cursor: grab; touch-action: none; }
 .figure-card figcaption { padding: 8px 12px 12px; font-size: 0.9rem; display: flex; flex-direction: column; gap: 4px; }
 .figure-card small { color: var(--muted); }
+
+/* 模型の保存・箱庭 */
+.figure-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.figure-badge { background: #fff3d6; }
+.garden-card { width: 100%; background: linear-gradient(#dff1ff, #fff8ef); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.garden3d { display: block; width: 100%; aspect-ratio: 4 / 3; cursor: grab; touch-action: none; }
+.garden-empty { padding: 24px; background: #fff8ef; border: 1px dashed var(--line); border-radius: 16px; }
+@media (max-width: 600px) { .garden3d { aspect-ratio: 1; } }
