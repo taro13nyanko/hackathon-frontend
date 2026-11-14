@@ -1,0 +1,33 @@
+# frontend の CI：PR と main への push のたびに、lint・型チェック＋ビルド・単体テストを通す。
+# 本番への反映は Vercel が main を見て行う（この CI はデプロイしない）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: lint（oxlint）
+        run: npm run lint
+      - name: 型チェック＋ビルド（tsc -b && vite build）
+        run: npm run build
+      - name: 単体テスト（node:test）
+        run: npm test
