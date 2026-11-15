@@ -249,3 +249,27 @@ test("理由「いま買える出品」（pick）は履歴ありの側に数え�
   assert.equal(recSubText(["starter", "starter"]), REC_SUB_STARTER);
   assert.equal(detailRecSub(["similar", "pick"]), "この商品に近い物と、箱庭・購入履歴から選んだ実在の出品");
 });
+
+// ---- 2026-11 再テスト：箱庭のカウンターがマイページと合わない、と見えた件（テスト2 の本番の形） ----
+
+test("本番のテスト2の形：カウンターはマイページと同じ 買った2・売った1・出品中4、フィギュア一覧は模型のある物だけ", () => {
+  const other = { id: "x", display_name: "x" };
+  const mine = [
+    item("m1", { figure: fig, photo_image_id: "img1", created_at: "2026-11-15T05:28:00Z" }), // 出品中・模型あり
+    item("m2", { photo_image_id: "img2", created_at: "2026-11-15T05:29:00Z" }), // 出品中・模型なし
+    item("m3", { created_at: "2026-11-15T05:30:00Z" }), // 出品中・模型なし
+    item("m4", { photo_image_id: "img4", moderation_status: "hidden", created_at: "2026-11-15T05:31:00Z" }), // 非公開（公開一覧には出ない）
+    item("m5", { status: "sold", created_at: "2026-11-15T05:20:00Z" }), // 売れた・模型なし
+  ];
+  const bought = [
+    purchase(item("b1", { figure: fig, status: "sold", seller: other }), "2026-11-15T07:00:00Z"),
+    purchase(item("b2", { figure: fig, status: "sold", seller: other }), "2026-11-15T08:00:00Z"),
+  ];
+  const g = buildGarden(mine, bought, [], null);
+  assert.deepEqual(gardenCounts(g), { sold: 1, bought: 2, selling: 4, models: 3 });
+  assert.deepEqual(myCounts(mySections(mine, bought)), { bought: 2, sold: 1, selling: 4 }, "マイページの件数チップと同じ");
+  // 「集めたフィギュア（模型のある物だけ）」のタグの数は、わざと模型のある物だけ（テスターが見た 買った2・売った0・出品中1）
+  const tags = { bought: 0, sold: 0, selling: 0 };
+  for (const e of figureRows(g.entries)) tags[e.tag] += 1;
+  assert.deepEqual(tags, { bought: 2, sold: 0, selling: 1 });
+});

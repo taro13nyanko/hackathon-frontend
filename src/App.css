@@ -226,6 +226,10 @@ img.thumb.small { height: 48px; }
   border-radius: var(--pill); background: var(--heading); color: #fff; text-align: center; box-shadow: var(--shadow);
 }
 
+/* 新しい版のお知らせ（「再読込」ボタンつき） */
+.update-toast { display: flex; align-items: center; gap: 12px; }
+.update-toast .update-reload { padding: 4px 12px; border-radius: var(--pill); background: #fff; color: var(--heading); font-weight: 800; }
+
 /* 商品への質問（AI） */
 .ask { margin: 16px 0; }
 .ask-form { display: flex; flex-direction: column; gap: 8px; }
@@ -576,6 +580,9 @@ img.thumb.small { height: 48px; }
 .garden-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .garden-main-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .garden-title { font-size: 1.6rem; font-weight: 900; }
+/* 箱庭のカウンター（マイページと同じ件数チップ）と「箱庭に並ぶのは…」の一言 */
+.garden-counts { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin: 0 0 12px; }
+.garden-counts small { font-size: 0.85rem; }
 .hint-chip { padding: 6px 12px; border-radius: var(--pill); background: var(--bg-soft); color: var(--heading); font-size: 0.85rem; font-weight: 700; box-shadow: var(--shadow); }
 .garden-main .garden-tools { margin: 8px 0 0; align-items: flex-start; }
 .garden-main .garden-help { flex: 1 1 240px; margin: 0; }
@@ -770,6 +777,9 @@ span.dm-icon { font-size: 1.2rem; }
 .reason-pick { background: #eef0f3; color: #4a5260; }
 /* おすすめが件数に満たないときの一言 */
 .rec-short { margin: 8px 0 0; font-size: 0.85rem; }
+/* ホームのおすすめの下の一言（並びが変わること・全件への導線） */
+.rec-note { margin: 8px 0 0; font-size: 0.85rem; }
+.rec-note .link { margin-left: 4px; }
 /* 一覧カードの出品者名（詳細と同じ表示名） */
 .card-seller { font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

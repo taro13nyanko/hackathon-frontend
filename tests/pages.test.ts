@@ -12,6 +12,7 @@ import {
   mySections,
   nextCursor,
   previewText,
+  readTarget,
   relativeTime,
   sellerName,
   unreadBadge,
@@ -168,4 +169,27 @@ test("送信の直前に相手が送ったメッセージを取りこぼさな�
   assert.deepEqual(nextPoll.map((m) => m.id), ["01C", "01D"]);
   cursor = nextCursor(cursor, nextPoll);
   assert.equal(cursor, "01D");
+});
+
+// ---- 既読は画面が見えているときだけ（2026-11 再テスト：裏のウィンドウで既読になり、未読がどこにも出なかった件） ----
+
+test("既読にする位置：見えていて先に進んだときだけ。裏では送らず、後戻り・同じ位置の二重送信もしない", () => {
+  assert.equal(readTarget("01B", "01A", true), "01B");
+  assert.equal(readTarget("01B", "01A", false), null, "裏では既読にしない");
+  assert.equal(readTarget("01A", "01B", true), null, "後戻りしない");
+  assert.equal(readTarget("01B", "01B", true), null, "同じ位置は2回送らない（focus と visibilitychange が重なっても）");
+  assert.equal(readTarget("", "", true), null, "まだ何も出していない");
+});
+
+test("未読：見えていないときは、開いている会話もサーバーの数を使う（既定は見えている扱いで前と同じ）", () => {
+  assert.equal(unreadOf({ id: "c1", unread_count: 2 }, "c1", true), 0);
+  assert.equal(unreadOf({ id: "c1", unread_count: 2 }, "c1", false), 2);
+  assert.equal(unreadOf({ id: "c2", unread_count: 1 }, "c1", true), 1);
+  assert.equal(unreadOf({ id: "c1", unread_count: 2 }, "c1"), 0, "引数を省くと見えている扱い");
+  const convs = [
+    { id: "c1", unread_count: 2 },
+    { id: "c2", unread_count: 1 },
+  ];
+  assert.equal(unreadTotal(convs, "c1"), 1);
+  assert.equal(unreadTotal(convs, "c1", false), 3);
 });
