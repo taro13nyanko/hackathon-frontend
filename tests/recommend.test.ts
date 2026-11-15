@@ -489,3 +489,17 @@ test("nearQuery：検索語と名前・説明が語を共有するときだけ t
   assert.equal(nearQuery("ゲーム機", mk("c", { title: "赤いマグカップ" })), false);
   assert.equal(nearQuery("   ", mk("d", { title: "赤いマグカップ" })), false);
 });
+
+// ---- 2026-11 再テスト：確認中の商品が購入完了の「つぎはこれ」に出た件 ----
+
+test("購入完了と同じ呼び方（excludeIds 付き・3件）でも、確認中と moderation_status の無い商品は出さない", () => {
+  const items = [
+    mk("a"),
+    mk("b", { moderation_status: "review", seller: { id: "other", display_name: "テスト3" }, created_at: FRESH }),
+    { ...mk("c", { created_at: FRESH }), moderation_status: undefined } as unknown as Item, // 項目が欠けた応答
+    mk("bought"),
+  ];
+  const got = ids(recommend(input({ items, viewerId: "viewer", excludeIds: ["bought"] }), 3));
+  assert.deepEqual(got, ["a"]);
+  assert.ok(!got.includes("b") && !got.includes("c"), "分からない値は出さない側に倒れる");
+});

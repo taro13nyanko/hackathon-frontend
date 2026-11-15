@@ -40,7 +40,48 @@ export function micErrorMessage(name: string): string {
     case "NotReadableError":
     case "AbortError":
       return "マイクを使えませんでした。ほかのアプリがマイクを使っていないか確かめてください";
+    case "TimeoutError":
+      return "マイクの許可を確認できませんでした。アドレスバーのマイクのアイコンから許可したら、もう一度🎤を押してください。キーワードでも探せます";
     default:
       return "この端末・ブラウザでは録音できません。キーワードで検索してください";
   }
+}
+
+// ---- マイクの許可を待つ間（許可の吹き出しが出ない・見えないまま、getUserMedia が返ってこないことがある） ----
+export const VOICE_PERMISSION_TIMEOUT_MS = 10_000; // これを過ぎたら待つのをやめて案内を出す
+export const VOICE_WAIT_HINT_MS = 3_000; // これだけ待っても返ってこなければ、先に一言出す
+export const VOICE_WAIT_HINT = "アドレスバー付近にマイクの許可が出ていないか確かめてください";
+
+// withTimeout は、p が ms 以内に決まらなければ name="TimeoutError" のエラーで失敗にする。
+// そのあとで p が成功したら、その値を onLate に渡す（遅れて届いたマイクの stream を止めて、マイクを放すため）
+export function withTimeout<T>(p: Promise<T>, ms: number, onLate?: (v: T) => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let late = false;
+    const timer = setTimeout(() => {
+      late = true;
+      const err = new Error("時間切れ");
+      err.name = "TimeoutError";
+      reject(err);
+    }, ms);
+    p.then(
+      (v) => {
+        if (late) onLate?.(v);
+        else {
+          clearTimeout(timer);
+          resolve(v);
+        }
+      },
+      (e) => {
+        if (late) return;
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+// permissionHint は、navigator.permissions.query({ name: "microphone" }) の state から、先に出す案内を決める。
+// ブロック済み（denied）なら、許可されていないときと同じ文。それ以外（prompt・granted）は null（そのまま getUserMedia へ）
+export function permissionHint(state: string): string | null {
+  return state === "denied" ? micErrorMessage("NotAllowedError") : null;
 }

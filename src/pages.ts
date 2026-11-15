@@ -48,15 +48,35 @@ export function chatItemBadges(item: Pick<Item, "status" | "seller" | "moderatio
 }
 
 // ---- 未読の数（GET /conversations の unread_count、GET /me/unread の count） ----
-// いま開いている会話は、画面に出ているので 0 として扱う（サーバーの既読は PUT …/read で追いつく）
-export function unreadOf(c: Pick<Conversation, "id" | "unread_count">, openId: string): number {
-  if (c.id === openId) return 0;
+// いま開いている会話は、画面に出ているので 0 として扱う（サーバーの既読は PUT …/read で追いつく）。
+// ただし画面が見えていない（裏のタブ・別のウィンドウを見ている）ときは、開いている会話もサーバーの unread_count をそのまま使う
+export function unreadOf(c: Pick<Conversation, "id" | "unread_count">, openId: string, visible = true): number {
+  if (visible && c.id === openId) return 0;
   const n = c.unread_count ?? 0;
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
-export function unreadTotal(convs: Pick<Conversation, "id" | "unread_count">[], openId: string): number {
-  return convs.reduce((sum, c) => sum + unreadOf(c, openId), 0);
+export function unreadTotal(convs: Pick<Conversation, "id" | "unread_count">[], openId: string, visible = true): number {
+  return convs.reduce((sum, c) => sum + unreadOf(c, openId, visible), 0);
+}
+
+// ---- 既読にしてよいか（画面が見えていて、この画面を使っているか） ----
+// ふつうはフォーカス（document.hasFocus）で見る。ただし、自動操作のブラウザなどでは、ページを操作していても
+// ウィンドウにフォーカスが来ないことがある。そこで、このページでクリックやキー操作があってから TOUCH_ACTIVE_MS の間も
+// 「使っている」とみなす（2つのウィンドウを並べたときは、別のウィンドウへ移った時点（blur）で操作の時刻を消すので、裏の方は既読にならない）
+export const TOUCH_ACTIVE_MS = 60_000;
+
+// sinceTouch：最後にこのページを操作してからの時間（ミリ秒）。まだ操作していなければ Infinity
+export function isReadable(visible: boolean, focused: boolean, sinceTouch: number, windowMs = TOUCH_ACTIVE_MS): boolean {
+  if (!visible) return false;
+  return focused || (sinceTouch >= 0 && sinceTouch < windowMs);
+}
+
+// readTarget は、既読にする位置を決める。画面が見えていて（visible：表示中で、フォーカスがあるか少し前に操作した。isReadable で決める）、
+// 画面に出した位置（pending）がもう既読にした位置（readUpTo）より先なら pending、それ以外は null（送らない）。
+// 裏にある間は既読にしない。同じ位置を2回送らず、後戻りもしない
+export function readTarget(pending: string, readUpTo: string, visible: boolean): string | null {
+  return visible && pending !== "" && pending > readUpTo ? pending : null;
 }
 
 // バッジの文字。0 以下は ""（バッジを出さない）、100 以上は「99+」

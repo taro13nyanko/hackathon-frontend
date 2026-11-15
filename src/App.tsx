@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import {
   API_URL,
   DISPLAY_NAME_MAX,
@@ -44,8 +44,20 @@ import { splitAnswer, sourceKindText } from "./answer";
 import { useAuth } from "./auth";
 import { patchLike, toggleLike, type LikeState } from "./likes";
 import { categoryLabels, moderationNote } from "./moderation";
-import { NO_RANGE, priceRangeLabel, type PriceRange } from "./search";
-import { VOICE_MAX_BYTES, VOICE_MAX_MS, baseMime, micErrorMessage, pickRecordingMime } from "./voice";
+import { NO_RANGE, isFiltered, nextSearch, priceRangeLabel, type PriceRange, type SearchEvent } from "./search";
+import {
+  VOICE_MAX_BYTES,
+  VOICE_MAX_MS,
+  VOICE_PERMISSION_TIMEOUT_MS,
+  VOICE_WAIT_HINT,
+  VOICE_WAIT_HINT_MS,
+  baseMime,
+  micErrorMessage,
+  permissionHint,
+  pickRecordingMime,
+  withTimeout,
+} from "./voice";
+import { PRELOAD_RELOAD_KEY, bundleName, canReloadAfterPreloadError, isNewVersion, shouldCheck } from "./version";
 import ErrorBoundary from "./ErrorBoundary";
 import type { GardenHandle } from "./Garden3D";
 import {
@@ -89,7 +101,9 @@ import {
   myCounts,
   mySections,
   nextCursor,
+  isReadable,
   previewText,
+  readTarget,
   relativeTime,
   sellerName,
   unreadBadge,
@@ -142,6 +156,61 @@ const BACK: Record<From, string> = {
 type SearchState = { q: string; range: PriceRange; heard: string; n: number };
 
 const TIMES: TimeOfDay[] = ["morning", "day", "evening", "night"];
+
+// ---- 画面が見えているか（表示中で、このウィンドウにフォーカスがあるか、少し前にこのページを操作した）。既読にしてよいかの判定に使う ----
+// 2つのウィンドウを横に並べると両方とも visible になるので、フォーカスも見る。
+// ただし自動操作のブラウザなどでは、操作していてもフォーカスが来ないことがあるので、クリック・キー操作から TOUCH_ACTIVE_MS の間も見ている扱いにする。
+// 別のウィンドウへ移ったとき（blur）は操作の時刻を消す（並べた裏のウィンドウが既読にならないように）
+let lastTouch = 0; // このページを最後にクリック・キー操作した時刻（0＝まだ・または別のウィンドウへ移った）
+if (typeof window !== "undefined") {
+  const touch = () => {
+    if (document.visibilityState === "visible") lastTouch = Date.now();
+  };
+  document.addEventListener("pointerdown", touch, true);
+  document.addEventListener("keydown", touch, true);
+  window.addEventListener("blur", () => {
+    lastTouch = 0;
+  });
+}
+function pageActive(): boolean {
+  if (typeof document === "undefined") return false;
+  return isReadable(document.visibilityState === "visible", document.hasFocus(), lastTouch === 0 ? Infinity : Date.now() - lastTouch);
+}
+function subscribePageActive(onChange: () => void): () => void {
+  document.addEventListener("visibilitychange", onChange);
+  document.addEventListener("pointerdown", onChange);
+  document.addEventListener("keydown", onChange);
+  window.addEventListener("focus", onChange);
+  window.addEventListener("blur", onChange);
+  return () => {
+    document.removeEventListener("visibilitychange", onChange);
+    document.removeEventListener("pointerdown", onChange);
+    document.removeEventListener("keydown", onChange);
+    window.removeEventListener("focus", onChange);
+    window.removeEventListener("blur", onChange);
+  };
+}
+// 見える・見えないが変わったら描き直す（未読のバッジの数を、そのときの状態で出すため）
+function usePageActive(): boolean {
+  return useSyncExternalStore(subscribePageActive, pageActive, () => true);
+}
+
+// ---- 版の確かめ：起動時に読み込んだ /assets/index-*.js の名前（開発サーバーでは ""＝確かめない） ----
+const BOOT_BUNDLE =
+  typeof document !== "undefined" ? bundleName(document.querySelector('script[type="module"][src*="/assets/index-"]')?.getAttribute("src") ?? "") : "";
+// いま配信中の index.html を読み、新しい版があるかだけを返す（読めなければ false）
+async function fetchIsNewVersion(): Promise<boolean> {
+  try {
+    const res = await fetch("/", { cache: "no-store" });
+    if (!res.ok) return false;
+    return isNewVersion(BOOT_BUNDLE, await res.text());
+  } catch {
+    return false;
+  }
+}
+// 再読込してはいけない画面（購入確認・出品の入力・チャットの最中・商品詳細。入力や確定の途中、まだ保存していない3D模型や AI の答えが消えるので）。
+// この画面では「新しい版があります」も出さない（商品詳細では、スマホで固定の購入ボタンに重なるため）
+const NO_RELOAD_VIEWS = new Set<string>(["confirm", "sell", "chat", "detail"]);
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "list" });
@@ -216,6 +285,51 @@ export default function App() {
     return () => clearTimeout(t);
   }, [hint]);
 
+  // 新しい版の確かめ（ホーム・さがす・購入完了・マイページへ移るときに、VERSION_CHECK_INTERVAL_MS に1回まで）。
+  // 新しい版があれば「新しい版があります」を出す。自動で再読込するのは、ホームへ移るとき（goHome）だけ
+  const [updateReady, setUpdateReady] = useState(false);
+  const [updateClosed, setUpdateClosed] = useState(false); // お知らせを × で閉じた（閉じても、ホームへ移るときの再読込はする）
+  const lastVersionCheck = useRef(0);
+  useEffect(() => {
+    if (!BOOT_BUNDLE || updateReady) return;
+    if (viewKind !== "list" && viewKind !== "search" && viewKind !== "bought" && viewKind !== "mypage") return;
+    const t = Date.now();
+    if (!shouldCheck(lastVersionCheck.current, t)) return;
+    lastVersionCheck.current = t;
+    fetchIsNewVersion().then((isNew) => isNew && setUpdateReady(true));
+  }, [viewKind, updateReady]);
+
+  // あとから読む JS（3D 模型など）が古い版のため読めなかったとき：再読込してよい画面なら1回だけ再読込する。
+  // 購入確認・出品の入力・チャット中・商品詳細は再読込せず、「新しい版があります」を出すだけ（出すのはその画面を離れてから）
+  const viewKindRef = useRef(viewKind);
+  useEffect(() => {
+    viewKindRef.current = viewKind;
+  });
+  useEffect(() => {
+    const onPreloadError = (e: Event) => {
+      if (NO_RELOAD_VIEWS.has(viewKindRef.current)) {
+        setUpdateReady(true);
+        return;
+      }
+      const t = Date.now();
+      try {
+        if (!canReloadAfterPreloadError(sessionStorage.getItem(PRELOAD_RELOAD_KEY), t)) {
+          setUpdateReady(true);
+          return;
+        }
+        sessionStorage.setItem(PRELOAD_RELOAD_KEY, String(t));
+      } catch {
+        // sessionStorage が使えない（印を置けない）ときは、再読込が止まらなくならないよう、自動では再読込しない
+        setUpdateReady(true);
+        return;
+      }
+      e.preventDefault();
+      window.location.reload();
+    };
+    window.addEventListener("vite:preloadError", onPreloadError);
+    return () => window.removeEventListener("vite:preloadError", onPreloadError);
+  }, []);
+
   const go = (v: View) => {
     setNotice("");
     setSeenTitles(loadSeenTitles()); // 詳細で見た商品を、次の画面のおすすめに反映する
@@ -226,19 +340,34 @@ export default function App() {
     go({ kind: "list" });
     setNotice(msg);
   };
+  // ロゴ・下部タブの「ホーム」から、自分でホームへ移るとき。新しい版が出ていれば、ここでだけ自動で再読込する
+  // （開き直してもホームから始まるので、途中の入力は無い）
+  const goHome = () => {
+    if (updateReady) {
+      window.location.reload();
+      return;
+    }
+    goList();
+  };
 
-  const runSearch = (q: string, range: PriceRange, heard = "") => {
-    setSearch((s) => ({ q, range, heard, n: s.n + 1 }));
+  // 検索の条件は search.ts の nextSearch で決める（手で打った検索は価格の範囲を引き継がない。範囲は音声検索の結果だけ）
+  const runSearch = (ev: SearchEvent) => {
+    setSearch((s) => ({ ...nextSearch(s, ev), n: s.n + 1 }));
     go({ kind: "search" });
   };
   const onSearch = (e: FormEvent) => {
     e.preventDefault();
-    runSearch(query, search.range);
+    runSearch({ source: "header", q: query });
   };
   const onVoice = (r: VoiceSearchResult) => {
     setVoiceError("");
     setQuery(r.q);
-    runSearch(r.q, { min: r.min_price, max: r.max_price }, r.transcript);
+    runSearch({ source: "voice", q: r.q, range: { min: r.min_price, max: r.max_price }, heard: r.transcript });
+  };
+  // 条件なしの全件（下部タブの「さがす」・「すべての商品を見る」・「条件を外して全件を見る」）
+  const showAll = (source: "tab" | "all") => {
+    setQuery("");
+    runSearch({ source });
   };
 
   // おすすめの入力（recommend.ts の形）。未ログインなら箱庭も購入履歴も空＝「まずはここから」
@@ -280,9 +409,9 @@ export default function App() {
       if (state.status === "signedOut") go({ kind: "login", next: key });
       return;
     }
-    if (key === "home") goList();
+    if (key === "home") goHome();
     else if (key === "search") {
-      go({ kind: "search" });
+      showAll("tab");
       searchInput.current?.focus();
     } else if (key === "sell") go({ kind: "sell" });
     else if (key === "messages") go({ kind: "inbox" });
@@ -310,7 +439,7 @@ export default function App() {
     <div className={welcome ? "app welcome-bg" : "app"}>
       {!welcome && (
       <header className="header">
-        <button className="logo" onClick={() => goList()}>
+        <button className="logo" onClick={goHome}>
           <span className="logo-mark" aria-hidden>
             ✦
           </span>
@@ -377,6 +506,18 @@ export default function App() {
             {hint}
           </p>
         )}
+        {/* 新しい版のお知らせ。購入確認・出品の入力・チャットの最中・商品詳細は出さない（押して途中が消えないように） */}
+        {updateReady && !updateClosed && !hint && !NO_RELOAD_VIEWS.has(viewKind) && (
+          <p className="toast update-toast" role="status">
+            新しい版があります
+            <button type="button" className="update-reload" onClick={() => window.location.reload()}>
+              再読込
+            </button>
+            <button type="button" className="update-close" aria-label="お知らせを閉じる" onClick={() => setUpdateClosed(true)}>
+              ×
+            </button>
+          </p>
+        )}
         {state.status === "needsProfile" || view.kind === "login" ? (
           <Welcome
             status={state.status}
@@ -397,7 +538,7 @@ export default function App() {
                 onLogin={login}
                 onOpen={(id) => go({ kind: "detail", id, from: "home" })}
                 onGarden={() => go({ kind: "garden" })}
-                onAll={() => runSearch("", NO_RANGE)}
+                onAll={() => showAll("all")}
                 recs={homeRecs}
                 rail={recRail}
                 onLike={patchAll}
@@ -407,7 +548,8 @@ export default function App() {
             {view.kind === "search" && (
               <ItemList
                 search={search}
-                onClearRange={() => runSearch(search.q, NO_RANGE)}
+                onClearRange={() => runSearch({ source: "clearRange" })}
+                onShowAll={() => showAll("all")}
                 onOpen={(id) => go({ kind: "detail", id, from: "search" })}
                 onMessage={setHint}
                 // 0件のときのおすすめ。語に近い物が1つも無ければ、見出しで「近い」とは言わない
@@ -709,6 +851,14 @@ function Home({
             すべての商品を見る →
           </button>
         }
+        note={
+          <p className="muted rec-note">
+            おすすめは開くたびに並びが変わります。
+            <button className="link" onClick={onAll}>
+              すべての商品を見る →
+            </button>
+          </p>
+        }
       />
     </div>
   );
@@ -764,7 +914,7 @@ function FigureList({
     <section className="panel figures" aria-labelledby="figures-title">
       <div className="panel-head">
         <h2 id="figures-title" className="panel-title">
-          集めたフィギュア
+          集めたフィギュア（模型のある物だけ）
         </h2>
         {!signedOut && !loading && !error && <span className="count-badge">全{rows.length}体</span>}
       </div>
@@ -843,9 +993,11 @@ function RecRail({
   hideEmpty = false,
   showReason = true,
   limit = 0,
+  note,
 }: {
   title: string;
   sub?: string;
+  note?: ReactNode; // 列の下に添える一言（ホームの「おすすめは開くたびに並びが変わります」）
   recs: Rec[];
   onOpen: (id: string) => void;
   onLike: (id: string, s: LikeState) => void;
@@ -894,6 +1046,7 @@ function RecRail({
         {short && <p className="muted rec-short">{short}</p>}
         </>
       )}
+      {!error && !loading && note}
     </section>
   );
 }
@@ -1053,12 +1206,14 @@ function GoogleMark() {
 function ItemList({
   search,
   onClearRange,
+  onShowAll,
   onOpen,
   onMessage,
   empty,
 }: {
   search: SearchState;
   onClearRange: () => void;
+  onShowAll: () => void; // 条件を外して全件を見る
   onOpen: (id: string) => void;
   onMessage: (msg: string) => void;
   empty: (q: string) => ReactNode; // 0件のときに下に出すもの（検索語に近いおすすめ）
@@ -1088,11 +1243,16 @@ function ItemList({
   }, [authStatus, search.n]);
 
   const rangeText = priceRangeLabel(search.range);
-  const filtered = search.q.trim() !== "" || rangeText !== "";
+  const filtered = isFiltered(search);
+  // 見出しに件数を出す（消えたのか、絞り込まれているだけなのかが分かるように）
+  const countText = items && !error ? `（${items.length}件）` : "";
   return (
     <section>
-      <h1>{search.q.trim() ? `「${search.q.trim()}」の検索結果` : "さがす"}</h1>
-      {(rangeText || search.heard) && (
+      <h1>
+        {search.q.trim() ? `「${search.q.trim()}」の検索結果` : "さがす"}
+        {countText}
+      </h1>
+      {(filtered || search.heard) && (
         <div className="search-extra">
           {search.heard && <span className="muted heard">『{search.heard}』で探しました</span>}
           {rangeText && (
@@ -1103,6 +1263,11 @@ function ItemList({
                 ×
               </button>
             </span>
+          )}
+          {filtered && (
+            <button type="button" className="link" onClick={onShowAll}>
+              条件を外して全件を見る
+            </button>
           )}
         </div>
       )}
@@ -1189,18 +1354,27 @@ function LikeButton({
 }
 
 // ---- 音声検索：押すと録音（最長15秒、もう一度押すと止める）→ Gemini が検索語と価格の範囲に直す ----
+// 音声検索の試行の番号を進める（それより前の試行の結果は、戻ってきても使わない）
+function nextAttempt(attempt: { current: number }): number {
+  return ++attempt.current;
+}
+
 function VoiceSearchButton({ onResult, onError }: { onResult: (r: VoiceSearchResult) => void; onError: (msg: string) => void }) {
-  // wait：マイクの許可を待っている間（ここで押し直しても2本目を始めない）
+  // wait：マイクの許可を待っている間（ここで押すと取り消す。2本目は始めない）
   const [phase, setPhase] = useState<"" | "wait" | "rec" | "send">("");
   const recorder = useRef<MediaRecorder | null>(null);
   const timer = useRef(0);
   const alive = useRef(true);
+  // 試行の番号。取り消し・画面を離れたときに進め、await から戻ったら自分の番号のままか確かめる
+  // （取り消してすぐ押し直したとき、前の試行の遅れた結果で録音が二重になったり、表示が消えたりしないように）
+  const attempt = useRef(0);
 
   // 画面を離れたら録音を止め、マイクを放す（送信もしない）
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
+      nextAttempt(attempt);
       clearTimeout(timer.current);
       const r = recorder.current;
       if (r && r.state !== "inactive") r.stop();
@@ -1208,25 +1382,52 @@ function VoiceSearchButton({ onResult, onError }: { onResult: (r: VoiceSearchRes
   }, []);
 
   async function start() {
+    const my = nextAttempt(attempt);
+    const current = () => alive.current && my === attempt.current;
     onError("");
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       onError(micErrorMessage(""));
       return;
     }
     setPhase("wait");
+    // ブロック済みなら、getUserMedia を待たずにすぐ案内する（permissions.query が無い・例外を出すブラウザは、そのまま次へ）
+    try {
+      const s = await navigator.permissions?.query({ name: "microphone" as PermissionName });
+      if (!current()) return;
+      const h = s ? permissionHint(s.state) : null;
+      if (h) {
+        onError(h);
+        setPhase("");
+        return;
+      }
+    } catch {
+      // 調べられないときは気にしない
+    }
+    if (!current()) return;
+    // 許可の吹き出しが出ない・見えないまま待ち続けることがあるので、少し待ったら先に一言出し、期限を過ぎたらやめる
+    const hintTimer = window.setTimeout(() => {
+      if (current()) onError(VOICE_WAIT_HINT);
+    }, VOICE_WAIT_HINT_MS);
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await withTimeout(navigator.mediaDevices.getUserMedia({ audio: true }), VOICE_PERMISSION_TIMEOUT_MS, (late) =>
+        late.getTracks().forEach((t) => t.stop()),
+      );
     } catch (e) {
+      clearTimeout(hintTimer);
+      // 取り消した・押し直した・画面を離れた後の失敗は、新しい試行の表示を変えない
+      if (!current()) return;
       onError(micErrorMessage((e as { name?: string }).name ?? ""));
-      if (alive.current) setPhase("");
+      setPhase("");
       return;
     }
+    clearTimeout(hintTimer);
     const release = () => stream.getTracks().forEach((t) => t.stop());
-    if (!alive.current) {
+    if (!current()) {
       release();
       return;
     }
+    onError(""); // 待っている間の一言を消す
     const type = pickRecordingMime((t) => MediaRecorder.isTypeSupported(t));
     let r: MediaRecorder;
     try {
@@ -1281,7 +1482,12 @@ function VoiceSearchButton({ onResult, onError }: { onResult: (r: VoiceSearchRes
 
   const onClick = () => {
     if (phase === "rec") recorder.current?.stop();
-    else if (phase === "") start();
+    else if (phase === "wait") {
+      // 取り消し：番号を進めて、待っている試行の結果を捨てる（遅れて届いたマイクは、その試行の側で放す）
+      nextAttempt(attempt);
+      onError("");
+      setPhase("");
+    } else if (phase === "") start();
   };
 
   return (
@@ -1289,11 +1495,11 @@ function VoiceSearchButton({ onResult, onError }: { onResult: (r: VoiceSearchRes
       type="button"
       className={`mic ${phase === "rec" ? "rec" : ""}`}
       onClick={onClick}
-      disabled={phase === "send" || phase === "wait"}
-      aria-label={phase === "rec" ? "録音を止めて検索" : "声で探す"}
-      title={phase === "rec" ? "もう一度押すと止めて検索します（最長15秒）" : "声で探す（例：3000円以下の電卓）"}
+      disabled={phase === "send"}
+      aria-label={phase === "rec" ? "録音を止めて検索" : phase === "wait" ? "マイクの準備を取り消す" : "声で探す"}
+      title={phase === "rec" ? "もう一度押すと止めて検索します（最長15秒）" : phase === "wait" ? "押すと取り消します" : "声で探す（例：3000円以下の電卓）"}
     >
-      {phase === "rec" ? "■ 止める" : phase === "send" ? "聞き取り中…" : phase === "wait" ? "準備中…" : "🎤"}
+      {phase === "rec" ? "■ 止める" : phase === "send" ? "聞き取り中…" : phase === "wait" ? "準備中…（押すと取消）" : "🎤"}
     </button>
   );
 }
@@ -2135,14 +2341,7 @@ function MyPage({
           </span>
           <div className="my-name">
             <h1>{name || "マイページ"}</h1>
-            <div className="my-counts" aria-label="件数">
-              {(["bought", "sold", "selling"] as const).map((k) => (
-                <span key={k} className={`my-count my-count-${k}`}>
-                  <small>{TAG_TEXT[k]}</small>
-                  <b>{counts ? counts[k] : "–"}</b>
-                </span>
-              ))}
-            </div>
+            <CountChips counts={counts} />
           </div>
         </div>
         <div className="my-garden">
@@ -2246,6 +2445,20 @@ function MySection({
   );
 }
 
+// ---- 件数チップ「買った・売った・出品中」（マイページと箱庭で同じ部品・同じ並び）。counts が無ければ「–」 ----
+function CountChips({ counts }: { counts: { bought: number; sold: number; selling: number } | null }) {
+  return (
+    <div className="my-counts" aria-label="件数">
+      {(["bought", "sold", "selling"] as const).map((k) => (
+        <span key={k} className={`my-count my-count-${k}`}>
+          <small>{TAG_TEXT[k]}</small>
+          <b>{counts ? counts[k] : "–"}</b>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ---- 箱庭（A-1）：左（2fr）に大きな島、右（1fr）にレベルカード（時間帯つき）と集めたフィギュア。
 //      並べ直し・記念撮影・紹介カード・模型がまだの商品は前のまま。データはホームと同じ useGarden ----
 function Garden({
@@ -2319,6 +2532,13 @@ function Garden({
                 </div>
                 {data.entries.length > 0 && <span className="hint-chip">✋ ドラッグで並び替えできるよ</span>}
               </div>
+              {/* カウンターはマイページと同じ件数チップ（模型の有無にかかわらず数える）。箱庭に並ぶのは、そのうち模型のある物 */}
+              {counts && (
+                <div className="garden-counts">
+                  <CountChips counts={counts} />
+                  <small className="muted">箱庭に並ぶのは、このうち模型のある {counts.models} 個</small>
+                </div>
+              )}
               {data.entries.length > 0 ? (
                 <>
                   <div className="garden-card" style={{ background: `linear-gradient(${skyTop}, ${skyBottom})` }}>
@@ -2371,11 +2591,6 @@ function Garden({
                   <span className="muted">時間帯</span>
                   <TimeToggle time={time} onChange={onTime} />
                 </div>
-                {counts && (
-                  <small className="muted">
-                    売った物 {counts.sold}・買った物 {counts.bought}・出品中 {counts.selling}（うち箱庭の模型 {counts.models}個）
-                  </small>
-                )}
                 {toMake.length > 0 && (
                   <button className="make-chip" onClick={showMissing}>
                     ✨ {makeableText(toMake.length)}
@@ -2476,6 +2691,8 @@ function Messages({
   const { state } = useAuth();
   const myId = state.status === "ready" ? state.me.id : "";
   const now = useNow();
+  // 画面が見えていないときは、開いている会話の未読もそのまま数える（裏のウィンドウにも未読が残るように）
+  const active = usePageActive();
 
   // 一覧は、開いた会話が変わるたび（一覧へ戻ったときも）と、LIST_POLL_MS ごとに読み直す
   // （ほかの相手からの新着・新しく始まった会話を、メッセージ画面を出なくても一覧に出すため）。
@@ -2483,8 +2700,10 @@ function Messages({
   const convId = conv?.id ?? "";
   const loaded = useRef(false);
   const unreadCb = useRef(onUnread);
+  const listNow = useRef<{ convs: Conversation[] | null; convId: string }>({ convs: null, convId: "" });
   useEffect(() => {
     unreadCb.current = onUnread;
+    listNow.current = { convs, convId };
   });
   useEffect(() => {
     let alive = true;
@@ -2495,7 +2714,7 @@ function Messages({
           loaded.current = true;
           setConvs(cs);
           setError("");
-          unreadCb.current(unreadTotal(cs, convId)); // 開いている会話は数えない（画面に出ているので）
+          unreadCb.current(unreadTotal(cs, convId, pageActive())); // 開いている会話は、画面が見えている間だけ数えない
         })
         .catch((e) => {
           if (alive && !loaded.current) setError(e instanceof Error ? e.message : String(e));
@@ -2507,6 +2726,12 @@ function Messages({
       clearInterval(t);
     };
   }, [convId]);
+
+  // 見える・見えないが変わったら、ナビの数もその状態で数え直す
+  useEffect(() => {
+    const { convs: cs, convId: id } = listNow.current;
+    if (cs) unreadCb.current(unreadTotal(cs, id, active));
+  }, [active]);
 
   // 詳細の「メッセージを送る」から来た新しい会話は、一覧に無ければ先頭に足して出す
   const list = convs && conv && !convs.some((c) => c.id === conv.id) ? [conv, ...convs] : convs;
@@ -2534,7 +2759,7 @@ function Messages({
         {list?.length === 0 && <p className="muted">まだやりとりはありません。商品ページの「メッセージを送る」から始められます。</p>}
         <ul className="dm-convs">
           {list?.map((c) => {
-            const n = unreadOf(c, convId);
+            const n = unreadOf(c, convId, active);
             return (
               <li key={c.id}>
                 <button
@@ -2656,15 +2881,29 @@ function Chat({
     let stopped = false;
     let timer: number | undefined;
     // 既読：会話を開いて最初に読んだとき・新しいメッセージを画面に出したときに、画面に出した最後のメッセージまでを
-    // 既読にする（PUT …/read）。同じ位置は2回送らない。失敗してもメッセージは使える（バッジが減らないだけ）
+    // 既読にする（PUT …/read）。ただし画面が見えている（表示中で、フォーカスがあるか少し前に操作した）ときだけ。裏にある間は pendingUpTo に
+    // ためておき、見えるようになったら（visibilitychange・focus）か、ページをクリック・キー操作したら送る。同じ位置は2回送らない（readTarget が readUpTo と比べる）。
+    // 失敗してもメッセージは使える（バッジが減らないだけ）
     let readUpTo = "";
-    const markShown = (lastShown: string) => {
-      if (lastShown <= readUpTo) return;
-      readUpTo = lastShown;
-      markRead(conv.id, lastShown)
+    let pendingUpTo = "";
+    const flush = () => {
+      if (stopped) return;
+      const target = readTarget(pendingUpTo, readUpTo, pageActive());
+      if (!target) return;
+      readUpTo = target;
+      markRead(conv.id, target)
         .then((total) => !stopped && readCb.current(total))
         .catch(() => undefined);
     };
+    const markShown = (lastShown: string) => {
+      if (lastShown > pendingUpTo) pendingUpTo = lastShown;
+      flush();
+    };
+    // クリック・キー操作は、lastTouch を更新したあと（バブリングの段階）で受ける
+    document.addEventListener("visibilitychange", flush);
+    document.addEventListener("pointerdown", flush);
+    document.addEventListener("keydown", flush);
+    window.addEventListener("focus", flush);
     const tick = async () => {
       try {
         const more = await listMessages(conv.id, lastId.current);
@@ -2685,6 +2924,10 @@ function Chat({
     return () => {
       stopped = true;
       window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", flush);
+      document.removeEventListener("pointerdown", flush);
+      document.removeEventListener("keydown", flush);
+      window.removeEventListener("focus", flush);
     };
   }, [conv.id]);
 
