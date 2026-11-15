@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent, type MouseEvent } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import {
   API_URL,
   DISPLAY_NAME_MAX,
@@ -11,8 +11,6 @@ import {
   listItems,
   makeFigure,
   saveFigure,
-  getGarden,
-  saveGarden,
   shrinkImage,
   uploadImage,
   listMyItems,
@@ -54,12 +52,30 @@ import {
   TAG_TEXT,
   TIME_TEXT,
   gardenLevel,
-  loadSeen,
-  saveSeen,
   timeOfDayAt,
   type GardenEntry,
+  type GardenLevel,
   type TimeOfDay,
 } from "./garden";
+import {
+  LOGIN_PROMPT,
+  TABS,
+  collectionText,
+  confirmChipText,
+  countAfterBuy,
+  detailRecSub,
+  figureRows,
+  gardenChipText,
+  levelChipText,
+  levelPercent,
+  recSubText,
+  tabOf,
+  type GardenData,
+  type TabKey,
+} from "./home";
+import { useGarden, type GardenState } from "./useGarden";
+import { chatBuyable, initialOf, myCounts, mySections, previewText, relativeTime } from "./pages";
+import { detailRecs, loadSeenTitles, nearQuery, recommend, rememberSeen, type Rec, type RecInput } from "./recommend";
 import "./App.css";
 
 // 3D 模型の表示（three.js は大きいので、使うときだけ読み込む）
@@ -68,141 +84,743 @@ const Garden3D = lazy(() => import("./Garden3D"));
 
 const yen = (n: number) => `¥${n.toLocaleString("ja-JP")}`;
 
-// 画面：一覧（list）／出品（sell）／詳細（detail）／購入確認（confirm）／購入完了（bought）／マイページ（mypage）
-//       ／メッセージ一覧（inbox）／メッセージ（chat）／箱庭（garden：売った物・買った物の模型を並べる）
-//       ／管理（admin：AI が「要確認」にした出品を管理者が見る。role が admin の人だけ）。
-// ログインして表示名が未登録のときは、どの画面よりも先にプロフィール登録を出す。
+// 画面：ホーム（list：箱庭・レベル・集めたフィギュア・あなたへのおすすめ）／さがす（search：全商品の一覧と検索）
+//       ／出品（sell）／詳細（detail）／購入確認（confirm）／購入完了（bought）／マイページ（mypage）
+//       ／メッセージ一覧（inbox）／メッセージ（chat）／箱庭（garden：ホームの箱庭を広げて並べかえ・記念撮影する）
+//       ／管理（admin：AI が「要確認」にした出品を管理者が見る。role が admin の人だけ）
+//       ／ログインの入口（login：ヘッダーの「ログイン」や、ログインが要るタブから来る。next はログイン後に開くタブ）。
+// ログインして表示名が未登録のときは、どの画面よりも先にプロフィール登録を出す（ログインの入口と同じカードの形）。
+// メッセージ一覧（inbox）とやりとり（chat）は1つの画面部品で出す（PC は2カラムで同時、スマホは一覧→会話の2段階）。
 // ページ遷移のライブラリ（React Router）はまだ入れていない。
+type From = "home" | "search" | "garden" | "admin" | "mypage";
 type View =
   | { kind: "list" }
+  | { kind: "search" }
   | { kind: "sell" }
-  | { kind: "detail"; id: string; from?: "garden" | "admin" } // from：戻るボタンの行き先（無ければ一覧）
-  | { kind: "confirm"; item: Item }
+  | { kind: "detail"; id: string; from?: From } // from：戻るボタンの行き先（無ければホーム）
+  | { kind: "confirm"; item: Item; from?: From } // from：やめて詳細へ戻るときに引き継ぐ
   | { kind: "bought"; item: Item }
   | { kind: "mypage" }
   | { kind: "inbox" }
   | { kind: "chat"; conv: Conversation }
-  | { kind: "garden" }
-  | { kind: "admin" };
+  | { kind: "garden"; from?: "home" | "mypage" } // from：戻るボタンの行き先（無ければホーム）
+  | { kind: "admin" }
+  | { kind: "login"; next?: TabKey };
+
+const BACK: Record<From, string> = {
+  home: "← ホームへ",
+  search: "← さがすへ",
+  garden: "← 箱庭へ",
+  admin: "← 管理へ",
+  mypage: "← マイページへ",
+};
+
+// 検索の条件（ヘッダーの検索欄・音声検索で決まり、「さがす」が読む）。n は「探し直した」回数（同じ条件でも読み直す）
+type SearchState = { q: string; range: PriceRange; heard: string; n: number };
+
+const TIMES: TimeOfDay[] = ["morning", "day", "evening", "night"];
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "list" });
   const [notice, setNotice] = useState("");
+  const [hint, setHint] = useState(""); // いいねの案内・失敗（画面の下に数秒だけ）
   const { state, error: authError, login, logout } = useAuth();
+  const authStatus = state.status;
+  const myId = state.status === "ready" ? state.me.id : "";
+  const viewKind = view.kind;
 
-  const goList = (msg = "") => {
-    setNotice(msg);
-    setView({ kind: "list" });
+  // 箱庭のデータはここで1つだけ持ち、ホーム・箱庭・おすすめで使う
+  const garden = useGarden(myId);
+  // 箱庭の空の時間帯（ヘッダー右端のトグル。既定は今の時刻）
+  const [time, setTime] = useState<TimeOfDay>(() => timeOfDayAt(new Date()));
+
+  // おすすめの元になる「通常一覧の商品」（GET /items の結果）
+  const [allItems, setAllItems] = useState<Item[] | null>(null);
+  const [itemsError, setItemsError] = useState("");
+  const allLatest = useRef(0);
+  const loadAll = () => {
+    const n = ++allLatest.current;
+    setItemsError("");
+    listItems()
+      .then((got) => n === allLatest.current && setAllItems(got))
+      .catch((e) => n === allLatest.current && setItemsError(e instanceof Error ? e.message : String(e)));
   };
 
+  // 検索欄（入力中の文字）と、送った検索の条件
+  const [query, setQuery] = useState("");
+  const [search, setSearch] = useState<SearchState>({ q: "", range: NO_RANGE, heard: "", n: 0 });
+  const [voiceError, setVoiceError] = useState("");
+  const searchInput = useRef<HTMLInputElement>(null);
+
+  // ホーム・購入完了に来たら、箱庭と商品を読み直す（買った・模型を保存した、が反映されるように）。
+  // ログインする人が変わったときは、どの画面でも読み直す（useGarden が前の人の箱庭を捨てるので、
+  // 詳細で「ログインして購入」したときなどに、おすすめが「読み込み中…」のまま止まらないように）
+  const gardenUser = useRef<string | null>(null);
+  useEffect(() => {
+    if (authStatus === "loading") return;
+    const userChanged = gardenUser.current !== myId;
+    gardenUser.current = myId;
+    if (userChanged || viewKind === "list" || viewKind === "garden" || viewKind === "bought") garden.reload();
+    if (viewKind === "list" || viewKind === "bought" || allItems === null) loadAll();
+  }, [authStatus, myId, viewKind]);
+
+  useEffect(() => {
+    if (!hint) return;
+    const t = window.setTimeout(() => setHint(""), 4000);
+    return () => clearTimeout(t);
+  }, [hint]);
+
+  const go = (v: View) => {
+    setNotice("");
+    setSeenTitles(loadSeenTitles()); // 詳細で見た商品を、次の画面のおすすめに反映する
+    setView(v);
+    window.scrollTo({ top: 0 });
+  };
+  const goList = (msg = "") => {
+    go({ kind: "list" });
+    setNotice(msg);
+  };
+
+  const runSearch = (q: string, range: PriceRange, heard = "") => {
+    setSearch((s) => ({ q, range, heard, n: s.n + 1 }));
+    go({ kind: "search" });
+  };
+  const onSearch = (e: FormEvent) => {
+    e.preventDefault();
+    runSearch(query, search.range);
+  };
+  const onVoice = (r: VoiceSearchResult) => {
+    setVoiceError("");
+    setQuery(r.q);
+    runSearch(r.q, { min: r.min_price, max: r.max_price }, r.transcript);
+  };
+
+  // おすすめの入力（recommend.ts の形）。未ログインなら箱庭も購入履歴も空＝「まずはここから」
+  const [now] = useState(() => new Date()); // 「新着」の判定に使う時刻（開いたときの時刻）
+  // 最近見た商品のタイトル（localStorage）。描画のたびには読まず、画面を移るとき（go）に読み直す
+  const [seenTitles, setSeenTitles] = useState(loadSeenTitles);
+  const recBase = useMemo<RecInput>(
+    () => ({
+      items: allItems ?? [],
+      viewerId: myId || undefined,
+      garden: garden.data?.entries ?? [],
+      purchases: garden.data?.purchases ?? [],
+      seenTitles,
+      now,
+    }),
+    [allItems, myId, garden.data, seenTitles, now],
+  );
+  // 商品と箱庭の両方がそろうまでは「読み込み中」（途中の結果で並びが入れ替わらないように）
+  const recsReady = allItems !== null && (!myId || garden.data !== null || garden.error !== "");
+  // おすすめの計算は、元の値が変わったときだけ（トーストの出し入れなどでは計算し直さない）
+  const searchQ = search.q.trim();
+  const boughtId = view.kind === "bought" ? view.item.id : "";
+  const homeRecs = useMemo(() => (recsReady && viewKind === "list" ? recommend(recBase, 4) : []), [recsReady, viewKind, recBase]);
+  const searchRecs = useMemo(
+    () => (recsReady && viewKind === "search" ? recommend({ ...recBase, query: searchQ }, 4) : []),
+    [recsReady, viewKind, recBase, searchQ],
+  );
+  const boughtRecs = useMemo(
+    () => (recsReady && boughtId ? recommend({ ...recBase, excludeIds: [boughtId] }, 3) : []),
+    [recsReady, recBase, boughtId],
+  );
+  const recRail = { loading: !recsReady && !itemsError, error: itemsError };
+  const patchAll = (id: string, s: LikeState) => setAllItems((list) => (list ? patchLike(list, id, s) : list));
+
+  // タブを開く（ログインが要るタブは、ログインしていなければ入口の画面へ。押したタブはログイン後に開く）
+  const onTab = (key: TabKey) => {
+    const tab = TABS.find((t) => t.key === key);
+    if (tab?.needsLogin && state.status !== "ready") {
+      if (state.status === "signedOut") go({ kind: "login", next: key });
+      return;
+    }
+    if (key === "home") goList();
+    else if (key === "search") {
+      go({ kind: "search" });
+      searchInput.current?.focus();
+    } else if (key === "sell") go({ kind: "sell" });
+    else if (key === "messages") go({ kind: "inbox" });
+    else go({ kind: "mypage" });
+  };
+
+  // ログインの入口から：ログインが済んだら、押したタブ（無ければホーム）へ進む
+  const leaveLogin = (next: TabKey | undefined, msg = "") => {
+    if (next) onTab(next);
+    else goList();
+    if (msg) setNotice(msg);
+  };
+  const loginNext = view.kind === "login" ? view.next : undefined;
+  useEffect(() => {
+    if (viewKind === "login" && authStatus === "ready") leaveLogin(loginNext);
+  }, [viewKind, authStatus]);
+
+  // 箱庭の画面ではレベルカードの中に時間帯トグルがあるので、ヘッダーに出すのはホームだけ
+  const showTime = viewKind === "list";
+  const currentTab = tabOf(viewKind);
+  // ログインの入口と、初回のプロフィール登録はヘッダーなし（見本どおりロゴとカードだけ）
+  const welcome = viewKind === "login" || state.status === "needsProfile";
+
   return (
-    <div className="app">
+    <div className={welcome ? "app welcome-bg" : "app"}>
+      {!welcome && (
       <header className="header">
         <button className="logo" onClick={() => goList()}>
+          <span className="logo-mark" aria-hidden>
+            ✦
+          </span>
           フリマ
         </button>
+        <form className="search header-search" role="search" onSubmit={onSearch}>
+          <input
+            ref={searchInput}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="アイテムやキーワードを検索"
+            aria-label="商品を検索"
+          />
+          {state.status === "ready" && <VoiceSearchButton onResult={onVoice} onError={setVoiceError} />}
+          <button className="search-go">検索</button>
+        </form>
         <div className="header-right">
           {state.status === "ready" && state.me.role === "admin" && (
-            <button className="ghost small" onClick={() => { setNotice(""); setView({ kind: "admin" }); }}>
+            <button className="ghost small" onClick={() => go({ kind: "admin" })}>
               管理
             </button>
           )}
           {state.status === "ready" && (
-            <button className="ghost small" onClick={() => { setNotice(""); setView({ kind: "inbox" }); }}>
-              メッセージ
+            <button className="ghost small header-only" onClick={() => go({ kind: "inbox" })}>
+              💬 メッセージ
             </button>
           )}
           {state.status === "ready" && view.kind !== "sell" && (
-            <button className="primary" onClick={() => { setNotice(""); setView({ kind: "sell" }); }}>
-              出品する
+            <button className="primary header-only" onClick={() => go({ kind: "sell" })}>
+              ＋ 出品する
             </button>
           )}
           {state.status === "signedOut" && (
-            <button className="primary" onClick={login}>
-              Google でログイン
+            <button className="primary" onClick={() => go({ kind: "login" })}>
+              ログイン
             </button>
           )}
-          {(state.status === "ready" || state.status === "needsProfile") && (
-            <span className="who">
-              {state.status === "ready" && (
-                <button className="name link" onClick={() => { setNotice(""); setView({ kind: "mypage" }); }} title="マイページ">
-                  {state.me.display_name}
-                </button>
-              )}
+          {state.status === "ready" && (
+            <span className="who header-only">
+              <button className="name link" onClick={() => go({ kind: "mypage" })} title="マイページ">
+                {state.me.display_name}
+              </button>
               <button className="ghost small logout" onClick={() => { logout(); goList(); }}>
                 ログアウト
               </button>
             </span>
           )}
+          {showTime && <TimeToggle time={time} onChange={setTime} />}
         </div>
       </header>
+      )}
 
-      <main>
+      <main className={view.kind === "list" ? "wide" : ""}>
         {authError && <p className="err">{authError}</p>}
         {notice && <p className="ok">{notice}</p>}
-        {state.status === "needsProfile" ? (
-          <ProfileForm email={state.email} onDone={(name) => goList(`ようこそ、${name} さん`)} />
+        {voiceError && <p className="err">{voiceError}</p>}
+        {hint && (
+          <p className="toast" role="status">
+            {hint}
+          </p>
+        )}
+        {state.status === "needsProfile" || view.kind === "login" ? (
+          <Welcome
+            status={state.status}
+            email={state.status === "needsProfile" ? state.email : ""}
+            prompt={view.kind === "login" && view.next && view.next in LOGIN_PROMPT ? LOGIN_PROMPT[view.next as keyof typeof LOGIN_PROMPT] : ""}
+            onLogin={login}
+            onLogout={() => logout()}
+            onHome={() => goList()}
+            onDone={(name) => (view.kind === "login" ? leaveLogin(view.next, `ようこそ、${name} さん`) : goList(`ようこそ、${name} さん`))}
+          />
         ) : (
           <>
-            {view.kind === "list" && <ItemList onOpen={(id) => { setNotice(""); setView({ kind: "detail", id }); }} />}
-            {view.kind === "sell" && <SellForm onDone={(id) => setView({ kind: "detail", id })} onCancel={() => goList()} />}
+            {view.kind === "list" && (
+              <Home
+                garden={garden}
+                time={time}
+                authStatus={authStatus}
+                onLogin={login}
+                onOpen={(id) => go({ kind: "detail", id, from: "home" })}
+                onGarden={() => go({ kind: "garden" })}
+                onAll={() => runSearch("", NO_RANGE)}
+                recs={homeRecs}
+                rail={recRail}
+                onLike={patchAll}
+                onMessage={setHint}
+              />
+            )}
+            {view.kind === "search" && (
+              <ItemList
+                search={search}
+                onClearRange={() => runSearch(search.q, NO_RANGE)}
+                onOpen={(id) => go({ kind: "detail", id, from: "search" })}
+                onMessage={setHint}
+                // 0件のときのおすすめ。語に近い物が1つも無ければ、見出しで「近い」とは言わない
+                empty={(q) => (
+                  <RecRail
+                    title={q && searchRecs.some((r) => nearQuery(q, r.item)) ? `「${q}」に近いおすすめ` : "あなたへのおすすめ"}
+                    sub={recSubText(searchRecs.map((r) => r.reason.kind))}
+                    recs={searchRecs}
+                    {...recRail}
+                    onOpen={(id) => go({ kind: "detail", id, from: "search" })}
+                    onLike={patchAll}
+                    onMessage={setHint}
+                  />
+                )}
+              />
+            )}
+            {view.kind === "sell" && <SellForm onDone={(id) => go({ kind: "detail", id })} onCancel={() => goList()} />}
             {view.kind === "detail" && (
               <ItemDetail
+                key={view.id} // 似ている出品から別の商品へ移ったら、前の商品の表示を残さない
                 id={view.id}
-                backLabel={view.from === "garden" ? "← 箱庭へ" : view.from === "admin" ? "← 管理へ" : "← 一覧へ"}
-                onBack={() =>
-                  view.from === "garden" ? setView({ kind: "garden" }) : view.from === "admin" ? setView({ kind: "admin" }) : goList()
-                }
-                onBuy={(item) => setView({ kind: "confirm", item })}
-                onChat={(conv) => setView({ kind: "chat", conv })}
+                backLabel={BACK[view.from ?? "home"]}
+                onBack={() => {
+                  const f = view.from ?? "home";
+                  if (f === "home") goList();
+                  else go(f === "search" ? { kind: "search" } : f === "garden" ? { kind: "garden" } : f === "admin" ? { kind: "admin" } : { kind: "mypage" });
+                }}
+                onBuy={(item) => go({ kind: "confirm", item, from: view.from })}
+                onChat={(conv) => go({ kind: "chat", conv })}
+                similar={(item) => (recsReady ? detailRecs(item, recBase, 3) : [])}
+                level={myId && garden.data ? gardenLevel(garden.data.entries.length) : null}
+                rail={recRail}
+                onOpen={(id) => go({ kind: "detail", id, from: view.from })}
+                onLike={patchAll}
+                onMessage={setHint}
               />
             )}
             {view.kind === "confirm" && (
               <BuyConfirm
                 item={view.item}
-                onDone={(item) => setView({ kind: "bought", item })}
-                onCancel={() => setView({ kind: "detail", id: view.item.id })}
+                onDone={(item) => go({ kind: "bought", item })}
+                onCancel={() => go({ kind: "detail", id: view.item.id, from: view.from })}
               />
             )}
             {view.kind === "bought" && (
               <Bought
                 item={view.item}
-                onMypage={() => setView({ kind: "mypage" })}
+                garden={garden.data}
+                gardenError={garden.error}
+                onMypage={() => go({ kind: "mypage" })}
                 onList={() => goList()}
-                onChat={(conv) => setView({ kind: "chat", conv })}
+                onChat={(conv) => go({ kind: "chat", conv })}
+                recs={boughtRecs}
+                rail={recRail}
+                onOpen={(id) => go({ kind: "detail", id, from: "home" })}
+                onLike={patchAll}
+                onMessage={setHint}
               />
             )}
             {view.kind === "mypage" && (
               <MyPage
-                onOpen={(id) => setView({ kind: "detail", id })}
-                onGarden={() => setView({ kind: "garden" })}
+                name={state.status === "ready" ? state.me.display_name : ""}
+                garden={garden}
+                onOpen={(id) => go({ kind: "detail", id, from: "mypage" })}
+                onGarden={() => go({ kind: "garden", from: "mypage" })}
                 onLogout={() => { logout(); goList(); }}
               />
             )}
             {view.kind === "garden" && (
-              <Garden onOpen={(id) => setView({ kind: "detail", id, from: "garden" })} onBack={() => setView({ kind: "mypage" })} />
-            )}
-            {view.kind === "inbox" && <Inbox onOpen={(conv) => setView({ kind: "chat", conv })} />}
-            {view.kind === "admin" && <AdminPage onOpen={(id) => setView({ kind: "detail", id, from: "admin" })} />}
-            {view.kind === "chat" && (
-              <Chat
-                conv={view.conv}
-                onBack={() => setView({ kind: "inbox" })}
-                onItem={(id) => setView({ kind: "detail", id })}
+              <Garden
+                garden={garden}
+                time={time}
+                onTime={setTime}
+                onOpen={(id) => go({ kind: "detail", id, from: "garden" })}
+                backLabel={BACK[view.from ?? "home"]}
+                onBack={() => (view.from === "mypage" ? go({ kind: "mypage" }) : goList())}
               />
             )}
+            {/* 一覧と会話を同じ場所に置く（一覧の読み込み結果を、会話を開いても捨てないように） */}
+            {(view.kind === "inbox" || view.kind === "chat") && (
+              <Messages
+                conv={view.kind === "chat" ? view.conv : null}
+                onOpen={(conv) => go({ kind: "chat", conv })}
+                onBack={() => go({ kind: "inbox" })}
+                onItem={(id) => go({ kind: "detail", id })}
+                onBuy={(item) => go({ kind: "confirm", item })}
+              />
+            )}
+            {view.kind === "admin" && <AdminPage onOpen={(id) => go({ kind: "detail", id, from: "admin" })} />}
           </>
         )}
       </main>
 
       <footer className="api">API: {API_URL}</footer>
+      {/* ログインの入口・初回登録（ヘッダーも無い画面）と購入確認（確定ボタンにタブが重ならないように）では下部タブを出さない */}
+      {!welcome && viewKind !== "confirm" && <TabBar current={currentTab} onTab={onTab} />}
     </div>
   );
 }
 
+// ---- 時間帯トグル（朝・昼・夕・夜）。変えるのは箱庭の空だけ ----
+function TimeToggle({ time, onChange }: { time: TimeOfDay; onChange: (t: TimeOfDay) => void }) {
+  return (
+    <div className="time-toggle" role="group" aria-label="箱庭の時間帯">
+      {TIMES.map((t) => (
+        <button
+          key={t}
+          type="button"
+          className={time === t ? "on" : ""}
+          aria-pressed={time === t}
+          aria-label={TIME_TEXT[t]}
+          title={`箱庭の空を${TIME_TEXT[t]}にする`}
+          onClick={() => onChange(t)}
+        >
+          {TIME_TEXT[t].slice(0, 1)}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---- 下部タブの線のアイコン（絵文字は端末で見た目が変わるので SVG で描く） ----
+function TabIcon({ tab }: { tab: TabKey }) {
+  const common = { width: 22, height: 22, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  switch (tab) {
+    case "home":
+      return (<svg {...common}><path d="M3 11l9-7 9 7" /><path d="M5 10v10h14V10" /><path d="M10 20v-5h4v5" /></svg>);
+    case "search":
+      return (<svg {...common}><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /></svg>);
+    case "sell":
+      return (<svg {...common} strokeWidth={2.6}><path d="M12 6v12M6 12h12" /></svg>);
+    case "messages":
+      return (<svg {...common}><path d="M4 5h16v11H9l-5 4z" /></svg>);
+    case "mypage":
+      return (<svg {...common}><circle cx="12" cy="8" r="4" /><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6" /></svg>);
+  }
+}
+
+// ---- 下部タブ（スマホだけ表示）：ホーム／さがす／出品（中央・赤）／メッセージ／マイページ ----
+function TabBar({ current, onTab }: { current: TabKey | null; onTab: (key: TabKey) => void }) {
+  return (
+    <nav className="tabbar" aria-label="メインメニュー">
+      {TABS.map((t) => (
+        <button
+          key={t.key}
+          type="button"
+          className={`tab ${t.key === "sell" ? "tab-sell" : ""} ${current === t.key ? "on" : ""}`}
+          aria-current={current === t.key ? "page" : undefined}
+          onClick={() => onTab(t.key)}
+        >
+          <span className="tab-icon" aria-hidden>
+            <TabIcon tab={t.key} />
+          </span>
+          <span className="tab-label">{t.label}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+// ---- ホーム（A-1）：左に箱庭、右にレベルと集めたフィギュア、下にあなたへのおすすめ ----
+type RailState = { loading: boolean; error: string };
+
+function Home({
+  garden,
+  time,
+  authStatus,
+  onLogin,
+  onOpen,
+  onGarden,
+  onAll,
+  recs,
+  rail,
+  onLike,
+  onMessage,
+}: {
+  garden: GardenState;
+  time: TimeOfDay;
+  authStatus: string;
+  onLogin: () => void;
+  onOpen: (id: string) => void;
+  onGarden: () => void;
+  onAll: () => void;
+  recs: Rec[];
+  rail: RailState;
+  onLike: (id: string, s: LikeState) => void;
+  onMessage: (msg: string) => void;
+}) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const entries = garden.data?.entries ?? [];
+  const level = gardenLevel(entries.length);
+  const signedOut = authStatus === "signedOut";
+  const loading = authStatus === "loading" || (!signedOut && garden.data === null && !garden.error);
+  // 読み込み中・失敗のときはレベルが分からない（Lv.1 と見せない）。未ログインは模型0体として出す
+  const known = !loading && !garden.error;
+  const sel = entries.find((e) => e.id === selected);
+  const [skyTop, skyBottom] = SKY_COLORS[time];
+
+  return (
+    <div className="home">
+      <section className="panel home-garden" aria-labelledby="home-garden-title">
+        <div className="panel-head">
+          <h2 id="home-garden-title" className="panel-title">
+            箱庭
+            {known && (
+              <>
+                {" "}
+                <span className="dash">―</span> {level.name}
+              </>
+            )}
+          </h2>
+          <span className="muted">いまは{TIME_TEXT[time]}</span>
+        </div>
+        <div className="garden-card" style={{ background: `linear-gradient(${skyTop}, ${skyBottom})` }}>
+          {loading ? (
+            <p className="garden-msg muted">箱庭を読み込み中…</p>
+          ) : garden.error ? (
+            <div className="garden-msg">
+              <p className="err">{garden.error}</p>
+              <button className="ghost small" onClick={garden.reload}>
+                もう一度読み込む
+              </button>
+            </div>
+          ) : signedOut ? (
+            <div className="garden-msg">
+              <p>ログインすると、売った物・買った物が3D模型になって、ここに並びます。</p>
+              <button className="primary" onClick={onLogin}>
+                Google でログイン
+              </button>
+            </div>
+          ) : entries.length === 0 ? (
+            <p className="garden-msg">
+              まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
+            </p>
+          ) : (
+            <ErrorBoundary fallback={<p className="garden-msg muted">箱庭を表示できませんでした</p>}>
+              <Suspense fallback={<p className="garden-msg muted">箱庭を準備中…</p>}>
+                <Garden3D entries={entries} time={time} selectedId={selected} onSelect={setSelected} onMove={garden.onMove} />
+              </Suspense>
+            </ErrorBoundary>
+          )}
+          {sel ? (
+            <GardenInfo entry={sel} onOpen={() => onOpen(sel.id)} onClose={() => setSelected(null)} />
+          ) : (
+            known && !signedOut && entries.length > 0 && <span className="collect-chip">{collectionText(entries.length)}</span>
+          )}
+        </div>
+        {!loading && !signedOut && entries.length > 0 && (
+          <div className="garden-foot">
+            <small className="muted">模型をタップで紹介、つかんで動かせます（自動で保存）</small>
+            <button className="link" onClick={onGarden}>
+              ひろげて並べかえ・記念撮影 →
+            </button>
+          </div>
+        )}
+        {garden.layoutMsg && <p className={garden.layoutMsg.endsWith("しました") ? "ok" : "err"}>{garden.layoutMsg}</p>}
+      </section>
+
+      <div className="home-side">
+        <LevelCard count={entries.length} known={known} failed={garden.error !== ""} />
+        <FigureList data={garden.data} signedOut={signedOut} loading={loading} error={garden.error} onOpen={onOpen} />
+      </div>
+
+      <RecRail
+        title="あなたへのおすすめ"
+        sub={recSubText(recs.map((r) => r.reason.kind))}
+        recs={recs}
+        {...rail}
+        onOpen={onOpen}
+        onLike={onLike}
+        onMessage={onMessage}
+        action={
+          <button className="link" onClick={onAll}>
+            すべての商品を見る →
+          </button>
+        }
+      />
+    </div>
+  );
+}
+
+// ---- レベルカード（gardenLevel をそのまま使う。％はバーと同じ数）。children は下に足す行（箱庭の画面の時間帯など） ----
+function LevelCard({ count, known, failed, children }: { count: number; known: boolean; failed: boolean; children?: ReactNode }) {
+  const level = gardenLevel(count);
+  const pct = levelPercent(level.progress);
+  // 箱庭を読み込むまで（と失敗したとき）は、レベルを出さずに骨組みだけ
+  if (!known)
+    return (
+      <section className="panel level-card" aria-label="箱庭のレベル" aria-busy={!failed}>
+        <div className="level-head">
+          <span className="garden-lv">Lv.–</span>
+          <b className="level-name muted">{failed ? "読み込めませんでした" : "読み込み中…"}</b>
+        </div>
+        <div className="garden-bar" aria-hidden />
+      </section>
+    );
+  return (
+    <section className="panel level-card" aria-label="箱庭のレベル">
+      <div className="level-head">
+        <span className="garden-lv">Lv.{level.lv}</span>
+        <b className="level-name">{level.name}</b>
+        <span className="level-pct">{pct}%</span>
+      </div>
+      <div className="garden-bar" role="progressbar" aria-label="次のレベルまで" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+        <i style={{ width: `${pct}%` }} />
+      </div>
+      <small className={children ? "level-next" : "muted"}>{level.next ? `あと${level.toNext}個で ${level.next.name}` : "いちばん大きな島になりました"}</small>
+      {children}
+    </section>
+  );
+}
+
+// ---- 集めたフィギュア（箱庭の模型の一覧。タグは 売った／出品中／買った と NEW だけ） ----
+function FigureList({
+  data,
+  signedOut,
+  loading,
+  error,
+  onOpen,
+}: {
+  data: GardenData | null;
+  signedOut: boolean;
+  loading: boolean;
+  error: string;
+  onOpen: (id: string) => void;
+}) {
+  const rows = figureRows(data?.entries ?? []);
+  return (
+    <section className="panel figures" aria-labelledby="figures-title">
+      <div className="panel-head">
+        <h2 id="figures-title" className="panel-title">
+          集めたフィギュア
+        </h2>
+        {!signedOut && !loading && !error && <span className="count-badge">全{rows.length}体</span>}
+      </div>
+      {signedOut ? (
+        <p className="muted">ログインすると、集めたフィギュアがここに並びます。</p>
+      ) : loading ? (
+        <p className="muted">読み込み中…</p>
+      ) : error ? (
+        <p className="err">読み込めませんでした</p>
+      ) : rows.length === 0 ? (
+        <p className="muted">まだフィギュアはありません。売った物・買った物の模型をつくると増えます。</p>
+      ) : (
+        <ul className="fig-rows">
+          {rows.map((e) => {
+            const it = data?.items[e.id];
+            return (
+              <li key={e.id}>
+                <button className="fig-row" onClick={() => onOpen(e.id)}>
+                  {it ? <Thumb item={it} className="thumb small" /> : <span className="thumb small" aria-hidden />}
+                  <span className="title">{e.title}</span>
+                  {e.isNew && <span className="garden-new">NEW</span>}
+                  <span className="tag" style={{ background: TAG_COLOR[e.tag] }}>
+                    {TAG_TEXT[e.tag]}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// ---- 箱庭で模型をタップしたときの紹介カード（ホームと箱庭で同じもの） ----
+const VERB: Record<GardenEntry["tag"], string> = { sold: "売った", bought: "買った", selling: "出品した" };
+
+function GardenInfo({ entry, onOpen, onClose }: { entry: GardenEntry; onOpen: () => void; onClose: () => void }) {
+  return (
+    <div className="garden-info">
+      <div className="garden-info-head">
+        <span className="tag" style={{ background: TAG_COLOR[entry.tag] }}>
+          {TAG_TEXT[entry.tag]}
+        </span>
+        <b>{entry.title}</b>
+      </div>
+      {entry.figure.caption && <p>{entry.figure.caption}</p>}
+      <p className="muted">
+        {yen(entry.price)}で{VERB[entry.tag]}
+      </p>
+      <div className="garden-info-actions">
+        <button className="primary small" onClick={onOpen}>
+          商品を見る
+        </button>
+        <button className="ghost small" onClick={onClose}>
+          閉じる
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---- おすすめの列（ホーム・検索0件・詳細の類似・購入完了の「つぎはこれ」で同じもの） ----
+// 実在の出品だけ（売り切れ・自分の出品は recommend.ts が除く）。広告枠ではないので「PR」等の印は付けない。
+function RecRail({
+  title,
+  sub,
+  recs,
+  loading,
+  error,
+  onOpen,
+  onLike,
+  onMessage,
+  action,
+  small = false,
+  hideEmpty = false,
+  showReason = true,
+}: {
+  title: string;
+  sub?: string;
+  recs: Rec[];
+  onOpen: (id: string) => void;
+  onLike: (id: string, s: LikeState) => void;
+  onMessage: (msg: string) => void;
+  action?: ReactNode;
+  small?: boolean;
+  hideEmpty?: boolean; // 0件なら列ごと出さない（詳細の「似ている出品」）
+  showReason?: boolean; // 理由チップ。詳細の「似ている出品」は見出しが理由なので出さない
+} & RailState) {
+  if (hideEmpty && !loading && !error && recs.length === 0) return null;
+  return (
+    <section className={`recs ${small ? "recs-small" : ""}`} aria-label={title}>
+      <div className="panel-head">
+        <h2 className="panel-title">{title}</h2>
+        {action}
+      </div>
+      {sub && <p className="muted rec-sub">{sub}</p>}
+      {error ? (
+        <p className="err">{error}</p>
+      ) : loading ? (
+        <p className="muted">読み込み中…</p>
+      ) : recs.length === 0 ? (
+        <p className="muted">いまおすすめできる出品はありません。</p>
+      ) : (
+        <ul className="rec-grid">
+          {recs.map((r) => (
+            <li key={r.item.id} className="card-wrap">
+              <button className="card rec-card" onClick={() => onOpen(r.item.id)}>
+                <span className="rec-thumb">
+                  <Thumb item={r.item} photoFirst />
+                  {(r.item.photo_image_id || r.item.figure) && <span className="model-chip">買うと模型になる</span>}
+                </span>
+                <span className="card-body">
+                  <span className="title">{r.item.title}</span>
+                  <span className="price">{yen(r.item.price)}</span>
+                  {showReason && <span className={`reason reason-${r.reason.kind}`}>{r.reason.text}</span>}
+                </span>
+              </button>
+              <LikeButton item={r.item} className="on-card" onChange={(s) => onLike(r.item.id, s)} onMessage={onMessage} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+
 // ---- 商品の見た目（模型 → 写真 → 頭文字の順で、あるものを出す） ----
-function Thumb({ item, className = "thumb" }: { item: Item; className?: string }) {
-  const id = item.figure_image_id || item.photo_image_id;
+// photoFirst：おすすめでは「商品そのもの」を見せたいので、写真 → 模型の順にする
+function Thumb({ item, className = "thumb", photoFirst = false }: { item: Item; className?: string; photoFirst?: boolean }) {
+  const id = photoFirst ? item.photo_image_id || item.figure_image_id : item.figure_image_id || item.photo_image_id;
   if (id) return <img className={`${className} img`} src={imageUrl(id)} alt="" loading="lazy" />;
   return (
     <div className={className} aria-hidden>
@@ -211,12 +829,32 @@ function Thumb({ item, className = "thumb" }: { item: Item; className?: string }
   );
 }
 
-// ---- プロフィール登録（初回ログイン時） ----
-function ProfileForm({ email, onDone }: { email: string; onDone: (name: string) => void }) {
+// ---- ログインの入口・プロフィール登録（初回のみ）：見本どおり、ロゴの下に2枚のカード ----
+// 左「ログイン」（Google でログイン）、右「プロフィール登録」（表示名・頭文字のアバター）。
+// 未ログインのときは右のカードを「ログインのあとに使う」として薄く出し、表示名が未登録のときは右を使う。
+// ログインの仕組み（Firebase のポップアップ）は auth.tsx のまま。
+function Welcome({
+  status,
+  email,
+  prompt,
+  onLogin,
+  onLogout,
+  onHome,
+  onDone,
+}: {
+  status: string;
+  email: string;
+  prompt: string;
+  onLogin: () => void;
+  onLogout: () => void;
+  onHome: () => void;
+  onDone: (name: string) => void;
+}) {
   const { register } = useAuth();
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const needsProfile = status === "needsProfile";
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -233,41 +871,123 @@ function ProfileForm({ email, onDone }: { email: string; onDone: (name: string) 
   };
 
   return (
-    <section>
-      <h1>はじめに表示名を決めてください</h1>
-      <p className="muted">{email} でログインしています。表示名は商品ページやメッセージで相手に見えます（メールアドレスは見えません）。</p>
-      <form className="sell" onSubmit={onSubmit}>
-        <label>
-          表示名 <small>（{name.length}/{DISPLAY_NAME_MAX}）</small>
-          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={DISPLAY_NAME_MAX} required autoFocus />
-        </label>
-        {error && <p className="err">{error}</p>}
-        <div className="actions">
-          <button className="primary" disabled={busy || !name.trim()}>
-            {busy ? "登録中…" : "はじめる"}
-          </button>
-        </div>
-      </form>
-    </section>
+    <div className="welcome">
+      <h1 className="welcome-logo">
+        <span className="welcome-mark" aria-hidden>
+          ✦
+        </span>
+        フリマ
+      </h1>
+      {prompt && !needsProfile && <p className="welcome-prompt">{prompt}</p>}
+      <div className="welcome-cards">
+        <section className="panel welcome-card" aria-labelledby="login-title">
+          <h2 id="login-title" className="welcome-title">
+            ログイン
+          </h2>
+          <p className="welcome-hello">フリマへようこそ</p>
+          {needsProfile ? (
+            <>
+              <p className="welcome-done">✓ {email || "Google アカウント"} でログインしました</p>
+              <button type="button" className="ghost small" onClick={onLogout}>
+                別のアカウントでログインし直す
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="google-btn" onClick={onLogin} disabled={status === "loading"}>
+                <GoogleMark />
+                Googleでログイン
+              </button>
+              <p className="muted">初めての方もそのまま始められます</p>
+            </>
+          )}
+        </section>
+
+        <section className={`panel welcome-card ${needsProfile ? "" : "is-later"}`} aria-labelledby="profile-title">
+          <h2 id="profile-title" className="welcome-title">
+            プロフィール登録
+            <br />
+            <small>（初回のみ）</small>
+          </h2>
+          <form className="profile-form" onSubmit={onSubmit}>
+            <fieldset disabled={!needsProfile || busy}>
+              <label>
+                <span className="label-line">
+                  表示名 <small className="muted">（{name.length}/{DISPLAY_NAME_MAX}）</small>
+                </span>
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  maxLength={DISPLAY_NAME_MAX}
+                  required
+                  autoFocus={needsProfile}
+                  placeholder="例：たろう"
+                />
+              </label>
+              <div className="avatar-preview">
+                <span className="muted">アバターのプレビュー</span>
+                <span className="avatar-row">
+                  <span className="avatar big" aria-hidden>
+                    {initialOf(name)}
+                  </span>
+                  <span>アバター: {name.trim() ? initialOf(name) : "（表示名の最初の1文字）"}</span>
+                </span>
+              </div>
+              {error && <p className="err">{error}</p>}
+              <button className="primary big-btn" disabled={!needsProfile || busy || !name.trim()}>
+                {busy ? "登録中…" : "登録してはじめる"}
+              </button>
+            </fieldset>
+          </form>
+          <small className="muted">
+            {needsProfile
+              ? "表示名は商品ページやメッセージで相手に見えます（メールアドレスは見えません）。"
+              : "Google でログインしたあと、ここで表示名を決めます。"}
+          </small>
+        </section>
+      </div>
+      {!needsProfile && (
+        <button type="button" className="link welcome-home" onClick={onHome}>
+          ← ログインせずにホームを見る
+        </button>
+      )}
+    </div>
   );
 }
 
-// ---- 一覧 + キーワード検索 ----
-function ItemList({ onOpen }: { onOpen: (id: string) => void }) {
+// Google のロゴ（ログインボタン用。画像ファイルを足さないよう SVG で描く）
+function GoogleMark() {
+  return (
+    <svg className="google-mark" viewBox="0 0 48 48" width="22" height="22" aria-hidden>
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+    </svg>
+  );
+}
+
+// ---- さがす：全商品の一覧と検索（検索欄・音声検索はヘッダー。ここは条件を受け取って読む） ----
+function ItemList({
+  search,
+  onClearRange,
+  onOpen,
+  onMessage,
+  empty,
+}: {
+  search: SearchState;
+  onClearRange: () => void;
+  onOpen: (id: string) => void;
+  onMessage: (msg: string) => void;
+  empty: (q: string) => ReactNode; // 0件のときに下に出すもの（検索語に近いおすすめ）
+}) {
   const { state } = useAuth();
   const [items, setItems] = useState<Item[] | null>(null);
-  const [query, setQuery] = useState("");
-  const [range, setRange] = useState<PriceRange>(NO_RANGE); // 音声検索で決まった価格の範囲（札の × で解除）
-  const [heard, setHeard] = useState(""); // 音声検索で聞き取った文
-  const [voiceError, setVoiceError] = useState("");
-  const [hint, setHint] = useState(""); // いいねの案内・失敗
   const [error, setError] = useState("");
-  const applied = useRef<{ q: string; range: PriceRange }>({ q: "", range: NO_RANGE }); // 今の一覧の検索条件
   const latest = useRef(0); // 続けて検索したとき、古い応答で上書きしない
 
   async function load(keyword: string, r: PriceRange) {
-    applied.current = { q: keyword, range: r };
-    setHint(""); // 検索し直したら、いいねの案内は消す
+    onMessage(""); // 検索し直したら、いいねの案内は消す
     const n = ++latest.current;
     setError("");
     try {
@@ -278,78 +998,47 @@ function ItemList({ onOpen }: { onOpen: (id: string) => void }) {
     }
   }
 
-  // 開いたとき・ログイン状態が決まったときに読み込む（ログイン中なら「いいね済み」も付いて返る）
+  // 開いたとき・探し直したとき・ログイン状態が決まったときに読み込む（ログイン中なら「いいね済み」も付いて返る）
   const authStatus = state.status;
   useEffect(() => {
     if (authStatus === "loading") return;
-    load(applied.current.q, applied.current.range);
-  }, [authStatus]);
+    load(search.q, search.range);
+  }, [authStatus, search.n]);
 
-  const onSearch = (e: FormEvent) => {
-    e.preventDefault();
-    setHeard("");
-    load(query, range);
-  };
-
-  const onVoice = (r: VoiceSearchResult) => {
-    const next = { min: r.min_price, max: r.max_price };
-    setVoiceError("");
-    setQuery(r.q);
-    setRange(next);
-    setHeard(r.transcript);
-    load(r.q, next);
-  };
-
-  // 札の × は価格の範囲だけを外す。検索欄の、まだ送っていない文字では探さない
-  const clearRange = () => {
-    setRange(NO_RANGE);
-    load(applied.current.q, NO_RANGE);
-  };
-
-  // いいねの案内は、一覧の上ではなく画面の下に数秒だけ出す（下の方のカードを押しても見えるように）
-  useEffect(() => {
-    if (!hint) return;
-    const t = window.setTimeout(() => setHint(""), 4000);
-    return () => clearTimeout(t);
-  }, [hint]);
-
-  const rangeText = priceRangeLabel(range);
+  const rangeText = priceRangeLabel(search.range);
+  const filtered = search.q.trim() !== "" || rangeText !== "";
   return (
     <section>
-      <form className="search" onSubmit={onSearch}>
-        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="何をお探しですか？（空欄で全件）" />
-        {state.status === "ready" && <VoiceSearchButton onResult={onVoice} onError={setVoiceError} />}
-        <button>検索</button>
-      </form>
-      {(rangeText || heard) && (
+      <h1>{search.q.trim() ? `「${search.q.trim()}」の検索結果` : "さがす"}</h1>
+      {(rangeText || search.heard) && (
         <div className="search-extra">
-          {heard && <span className="muted heard">『{heard}』で探しました</span>}
+          {search.heard && <span className="muted heard">『{search.heard}』で探しました</span>}
           {rangeText && (
             <span className="price-chip">
               {rangeText}
-              <button type="button" onClick={clearRange} aria-label="価格の範囲を解除">
+              {/* 札の × は価格の範囲だけを外す。検索欄の、まだ送っていない文字では探さない */}
+              <button type="button" onClick={onClearRange} aria-label="価格の範囲を解除">
                 ×
               </button>
             </span>
           )}
         </div>
       )}
-      {voiceError && <p className="err">{voiceError}</p>}
 
       {error && <p className="err">{error}</p>}
-      {hint && (
-        <p className="toast" role="status">
-          {hint}
-        </p>
-      )}
       {items === null && !error && <p className="muted">読み込み中…</p>}
-      {items?.length === 0 && <p className="muted">商品が見つかりませんでした</p>}
+      {items?.length === 0 && (
+        <>
+          <p className="muted">{filtered ? "商品が見つかりませんでした" : "まだ出品がありません"}</p>
+          {empty(search.q.trim())}
+        </>
+      )}
 
       <ul className="grid">
         {items?.map((it) => (
           <li key={it.id} className="card-wrap">
             <button className="card" onClick={() => onOpen(it.id)}>
-              <Thumb item={it} />
+              <Thumb item={it} photoFirst />
               <div className="card-body">
                 <span className="title">{it.title}</span>
                 <span className="price">{yen(it.price)}</span>
@@ -361,7 +1050,7 @@ function ItemList({ onOpen }: { onOpen: (id: string) => void }) {
               item={it}
               className="on-card"
               onChange={(s) => setItems((list) => (list ? patchLike(list, it.id, s) : list))}
-              onMessage={setHint}
+              onMessage={onMessage}
             />
           </li>
         ))}
@@ -525,7 +1214,8 @@ function VoiceSearchButton({ onResult, onError }: { onResult: (r: VoiceSearchRes
   );
 }
 
-// ---- 出品フォーム ----
+// ---- 出品フォーム（A-1）：PC は3カラム（写真／商品名・AI で説明文・説明・価格／模型プレビュー）＋横幅いっぱいの「出品する」。
+// スマホは縦1列（写真 → 商品情報（AI 説明）→ 模型 → 出品する） ----
 function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel: () => void }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -539,6 +1229,10 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
   const [photoBusy, setPhotoBusy] = useState(false);
   const [photoError, setPhotoError] = useState("");
   const [blocked, setBlocked] = useState<{ reason: string; categories: string[] } | null>(null); // AI の確認で止められた
+  // 模型プレビュー：出品前に写真から模型をつくって見せる。出品できたら、その商品に保存する（箱庭に並ぶ）
+  const [figure, setFigure] = useState<Figure | null>(null);
+  const [making, setMaking] = useState(false);
+  const [figError, setFigError] = useState("");
   const top = useRef<HTMLHeadingElement>(null);
 
   // 写真を選んだら、縮めてすぐ上げる（出品ボタンを押したときに待たせない）
@@ -550,6 +1244,7 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
       const blob = await shrinkImage(file);
       const id = await uploadImage(blob);
       setPhoto({ id, preview: URL.createObjectURL(blob) });
+      setFigure(null); // 写真を変えたら、前の写真の模型は使わない
     } catch (e) {
       setPhotoError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -581,6 +1276,24 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
     }
   };
 
+  // 写真と商品名から、商品そのものの模型（デフォルメ）をつくる。出品前なので下書き1回だけ（仕上げは詳細ページでできる）
+  const onPreview = async () => {
+    if (!photo) return;
+    setFigError("");
+    if (!title.trim()) {
+      setFigError("先に商品名を入れてください");
+      return;
+    }
+    setMaking(true);
+    try {
+      setFigure(await makeFigure(photo.id, title.trim()));
+    } catch (e) {
+      setFigError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMaking(false);
+    }
+  };
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const p = Number(price);
@@ -595,6 +1308,10 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
     try {
       // 確認中（review）でも出品はされる。理由は詳細ページで出品者にだけ見える
       const created = await createItem({ title: title.trim(), description: description.trim(), price: p, photo_image_id: photo?.id });
+      if (figure) {
+        // 模型の保存に失敗しても出品はできている。詳細ページの「写真から3D模型をつくる」でやり直せる
+        await saveFigure(created.id, figure).catch(() => undefined);
+      }
       onDone(created.id);
     } catch (e) {
       if (e instanceof ProhibitedError) {
@@ -610,8 +1327,11 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
   };
 
   return (
-    <section>
-      <h1 ref={top}>商品を出品</h1>
+    <section className="sell-page">
+      <h1 ref={top} className="page-title">
+        商品を出品する
+      </h1>
+      <p className="muted page-sub">写真・情報を入力して出品しよう</p>
       {blocked && (
         <div className="prohibited" role="alert">
           <b>この内容では出品できません</b>
@@ -628,72 +1348,119 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
           <small>写真・商品名・説明を AI が確認しています。入力はそのまま残してあるので、内容を直せばもう一度出品できます。</small>
         </div>
       )}
+      {/* PC は3カラム（写真／商品情報／模型プレビュー）＋下に横幅いっぱいの「出品する」。スマホは縦1列 */}
       <form className="sell" onSubmit={onSubmit}>
-        <div className="photo-pick">
+        <div className="panel sell-col sell-photo">
+          <h2 className="panel-title">📷 写真</h2>
           <label className="photo-box">
             {photo ? <img src={photo.preview} alt="選んだ写真" /> : <span>{photoBusy ? "写真を準備中…" : "＋ 写真を追加"}</span>}
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(e) => onPhoto(e.target.files?.[0])}
-              disabled={photoBusy || busy}
-              hidden
-            />
+            <input type="file" accept="image/*" onChange={(e) => onPhoto(e.target.files?.[0])} disabled={photoBusy || busy} hidden />
           </label>
-          {photo && !photoBusy && (
-            <button type="button" className="link" onClick={() => setPhoto(null)}>
-              写真を外す
-            </button>
-          )}
+          <div className="photo-actions">
+            {photo && (
+              <label className={`outline small file-btn ${photoBusy || busy ? "disabled" : ""}`}>
+                📷 写真を変更
+                <input type="file" accept="image/*" onChange={(e) => onPhoto(e.target.files?.[0])} disabled={photoBusy || busy} hidden />
+              </label>
+            )}
+            {photo && !photoBusy && (
+              <button type="button" className="link" onClick={() => { setPhoto(null); setFigure(null); }}>
+                写真を外す
+              </button>
+            )}
+          </div>
+          {photoBusy && photo && <small className="muted">写真を準備中…</small>}
           {photoError && <p className="err">{photoError}</p>}
         </div>
-        <label>
-          商品名 <small>（{title.length}/{r.titleMax}）</small>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={r.titleMax} required />
-        </label>
-        <label>
-          商品の説明 <small>（{description.length}/{r.descriptionMax}）</small>
-          <textarea
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            maxLength={r.descriptionMax}
-            rows={6}
-            placeholder="状態、使用期間、受け渡し方法など（メモ書きでもOK。「AI で説明文に整える」で文章にできます）"
-          />
-        </label>
-        <div className="ai">
-          <button type="button" className="ghost" onClick={onDraft} disabled={drafting || busy}>
-            {drafting ? "Gemini が作成中…" : "AI で説明文に整える"}
-          </button>
-          {before !== null && !drafting && (
-            <button type="button" className="link" onClick={() => { setDescription(before); setBefore(null); }}>
-              元に戻す
+
+        <div className="panel sell-col sell-info">
+          <h2 className="panel-title">✏️ 商品情報を入力</h2>
+          <label>
+            <span className="field-name">
+              商品名 <small>（{title.length}/{r.titleMax}）</small>
+            </span>
+            <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={r.titleMax} required />
+          </label>
+          <div className="ai">
+            <button type="button" className="primary ai-btn" onClick={onDraft} disabled={drafting || busy}>
+              {drafting ? "Gemini が作成中…" : "✨ AIで説明文を作る"}
             </button>
-          )}
-          <small className="muted">商品名と説明欄のメモだけをもとに書きます。内容を確かめて直してから出品してください。</small>
-          {aiError && <p className="err">{aiError}</p>}
+            {before !== null && !drafting && (
+              <button type="button" className="link" onClick={() => { setDescription(before); setBefore(null); }}>
+                元に戻す
+              </button>
+            )}
+            <small className="muted">商品名と説明欄のメモだけをもとに書きます。内容を確かめて直してから出品してください。</small>
+            {aiError && <p className="err">{aiError}</p>}
+          </div>
+          <label>
+            <span className="field-name">
+              商品説明 <small>（{description.length}/{r.descriptionMax}）</small>
+            </span>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              maxLength={r.descriptionMax}
+              rows={5}
+              placeholder="状態、使用期間、受け渡し方法など（メモ書きでもOK。「AIで説明文を作る」で文章にできます）"
+            />
+          </label>
+          <label>
+            価格（円）
+            <span className="yen-input">
+              <span aria-hidden>¥</span>
+              <input
+                type="number"
+                inputMode="numeric"
+                value={price}
+                onChange={(e) => setPrice(e.target.value)}
+                min={r.priceMin}
+                max={r.priceMax}
+                step={1}
+                placeholder={`${r.priceMin}〜${r.priceMax.toLocaleString()}`}
+                required
+              />
+            </span>
+          </label>
         </div>
-        <label>
-          価格（円）
-          <input
-            type="number"
-            inputMode="numeric"
-            value={price}
-            onChange={(e) => setPrice(e.target.value)}
-            min={r.priceMin}
-            max={r.priceMax}
-            step={1}
-            placeholder={`${r.priceMin}〜${r.priceMax.toLocaleString()}`}
-            required
-          />
-        </label>
-        {error && <p className="err">{error}</p>}
-        <div className="actions">
-          <button type="button" className="ghost" onClick={onCancel}>
-            やめる
+
+        <div className="panel sell-col sell-model">
+          <h2 className="panel-title">✨ 模型プレビュー</h2>
+          {figure ? (
+            <figure className="figure-card">
+              <ErrorBoundary fallback={<p className="muted">この模型は表示できませんでした</p>}>
+                <Suspense fallback={<p className="muted">模型を準備中…</p>}>
+                  <Figure3D figure={figure} />
+                </Suspense>
+              </ErrorBoundary>
+              <figcaption>
+                <b>{figure.name}</b> {figure.caption}
+                <small>ドラッグで回せます</small>
+              </figcaption>
+            </figure>
+          ) : (
+            <div className="model-empty">
+              <small className="muted">写真と商品名から、Gemini が商品そのものの模型をつくります（なくても出品できます）。</small>
+            </div>
+          )}
+          <span className="buy-chip">買われたら箱庭に並びます</span>
+          <div className="figure-actions">
+            <button type="button" className="outline" onClick={onPreview} disabled={!photo || making || busy || photoBusy}>
+              {making ? "AI が写真をよく見て模型をつくっています…（1分ほど）" : figure ? "もう一度つくる" : "✨ 模型をプレビュー"}
+            </button>
+          </div>
+          {!photo && <small className="muted">写真を追加すると、模型をつくれます</small>}
+          {figure && <small className="muted">出品すると、この模型も保存されて箱庭に並びます</small>}
+          {figError && <p className="err">{figError}</p>}
+        </div>
+
+        <div className="sell-submit">
+          {error && <p className="err">{error}</p>}
+          <button className="primary sell-go" disabled={busy || photoBusy || making}>
+            {busy ? "AI が出品内容を確認中…" : "➤ 出品する"}
           </button>
-          <button className="primary" disabled={busy || photoBusy}>
-            {busy ? "AI が出品内容を確認中…" : "出品する"}
+          <button type="button" className="link" onClick={onCancel}>
+            やめる
           </button>
         </div>
       </form>
@@ -701,19 +1468,32 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
   );
 }
 
-// ---- 商品詳細 ----
+// ---- 商品詳細（A-1）：左に商品写真のカード、右に名前・価格・出品者・チップ・説明・購入、下に横幅いっぱいのおすすめ帯 ----
+// 見本に無い物（模型づくり・確認中の印・質問）は、写真カードの下と右カードの下に置く。スマホは縦1列で、購入ボタンは画面下に固定。
 function ItemDetail({
   id,
   backLabel,
   onBack,
   onBuy,
   onChat,
+  similar,
+  level,
+  rail,
+  onOpen,
+  onLike,
+  onMessage,
 }: {
   id: string;
   backLabel: string;
   onBack: () => void;
   onBuy: (item: Item) => void;
   onChat: (conv: Conversation) => void;
+  similar: (item: Item) => Rec[]; // おすすめ帯（この商品に近い物 → 通常のおすすめ。detailRecs）
+  level: GardenLevel | null; // 自分の箱庭のレベル（未ログイン・読み込み中は null）
+  rail: RailState;
+  onOpen: (id: string) => void;
+  onLike: (id: string, s: LikeState) => void;
+  onMessage: (msg: string) => void;
 }) {
   const [item, setItem] = useState<Item | null>(null);
   const [error, setError] = useState("");
@@ -726,7 +1506,11 @@ function ItemDetail({
     if (authStatus === "loading") return;
     let stale = false;
     getItem(id)
-      .then((it) => !stale && setItem(it))
+      .then((it) => {
+        if (stale) return;
+        setItem(it);
+        rememberSeen(it.title); // 「前に見た商品に近い」おすすめに使う（この端末だけ）
+      })
       .catch((e) => !stale && setError(e instanceof Error ? e.message : String(e)));
     return () => {
       stale = true;
@@ -735,63 +1519,109 @@ function ItemDetail({
 
   const note = item ? moderationNote(item.moderation_status, item.moderation_reason) : null;
   const hidden = item?.moderation_status === "hidden"; // 非公開：買う・メッセージ・質問はできない
+  const mine = state.status === "ready" && item?.seller?.id === state.me.id;
+  // ログイン状態の判定中は、ボタンの無い固定バーが一瞬出ないように「買える」にしない
+  const canBuy = !!item && !hidden && item.status === "on_sale" && !mine && state.status !== "loading";
+  const chip = item && canBuy ? gardenChipText(item) : "";
+  // 「あと{toNext}個で進化」は、買うと箱庭に増える物で、ログイン中・次のレベルがあるときだけ
+  const evolve = chip && level ? levelChipText(level) : "";
+  const recs = item && !hidden ? similar(item) : [];
 
   return (
-    <section>
-      <button className="ghost" onClick={onBack}>
+    <section className={canBuy ? "detail-page has-buy-bar" : "detail-page"}>
+      <button className="ghost back" onClick={onBack}>
         {backLabel}
       </button>
       {error && <p className="err">{error}</p>}
       {!item && !error && <p className="muted">読み込み中…</p>}
       {item && (
         <article className="detail">
-          <Thumb item={item} className="thumb large" />
-          {item.figure_image_id && item.photo_image_id && (
-            <img className="photo" src={imageUrl(item.photo_image_id)} alt={`${item.title}の写真`} loading="lazy" />
-          )}
-          {!hidden && (item.photo_image_id || item.figure) && (
-            <FigureMaker
-              item={item}
-              myId={state.status === "ready" ? state.me.id : null}
-              onSaved={(figure) => setItem({ ...item, figure, figure_caption: figure.caption })}
-            />
-          )}
-          <h1>{item.title}</h1>
-          {note && <p className={`mod-note ${note.kind}`}>{note.text}</p>}
-          <div className="price-line">
-            <p className="price big">{yen(item.price)}</p>
-            {!hidden && (
-              <LikeButton item={item} onChange={(s) => setItem((it) => (it ? { ...it, ...s } : it))} onMessage={setLikeMsg} />
+          <div className="detail-left">
+            <div className="panel detail-photo">
+              <Thumb item={item} className="thumb large" photoFirst />
+            </div>
+            {!hidden && (item.photo_image_id || item.figure) && (
+              <div className="panel detail-extra">
+                <h2 className="panel-title">箱庭の模型</h2>
+                <FigureMaker
+                  item={item}
+                  myId={state.status === "ready" ? state.me.id : null}
+                  onSaved={(figure) => setItem({ ...item, figure, figure_caption: figure.caption })}
+                />
+              </div>
             )}
           </div>
-          {likeMsg && <p className="muted">{likeMsg}</p>}
-          <p className="status">{item.status === "on_sale" ? "出品中" : "売り切れ"}</p>
-          <p className="seller">出品者: {item.seller ? item.seller.display_name : "（見本データ）"}</p>
-          <h2>商品の説明</h2>
-          <p className="desc">{item.description || "（説明なし）"}</p>
-          <p className="muted">出品日時: {new Date(item.created_at).toLocaleString("ja-JP")}</p>
-          {!hidden && <AskBox itemId={item.id} />}
-          <div className="buy">
-            {hidden ? null : item.status === "sold" ? (
-              <button className="primary" disabled>
-                売り切れ
-              </button>
-            ) : state.status === "ready" && item.seller?.id === state.me.id ? (
-              <p className="muted">あなたが出品した商品です</p>
-            ) : state.status === "ready" ? (
-              <button className="primary" onClick={() => onBuy(item)}>
-                購入手続きへ
-              </button>
-            ) : state.status === "signedOut" ? (
-              <button className="primary" onClick={login}>
-                ログインして購入
-              </button>
-            ) : null}
-            {!hidden && state.status === "ready" && item.seller && item.seller.id !== state.me.id && (
-              <StartChatButton itemId={item.id} onChat={onChat} label="出品者にメッセージ" />
+          <div className="detail-right">
+            <div className="panel detail-info">
+              <h1>{item.title}</h1>
+              {note && <p className={`mod-note ${note.kind}`}>{note.text}</p>}
+              <div className="price-line">
+                <p className="price big">{yen(item.price)}</p>
+                {item.status === "sold" && <span className="badge sold-badge">売り切れ</span>}
+                {!hidden && (
+                  <LikeButton item={item} onChange={(s) => setItem((it) => (it ? { ...it, ...s } : it))} onMessage={setLikeMsg} />
+                )}
+              </div>
+              {likeMsg && <p className="muted">{likeMsg}</p>}
+              <p className="seller">
+                <span className="avatar" aria-hidden>
+                  {item.seller ? initialOf(item.seller.display_name) : "見"}
+                </span>
+                出品者 {item.seller ? item.seller.display_name : "（見本データ）"}
+              </p>
+              {(chip || evolve) && (
+                <p className="buy-chips">
+                  {chip && <span className="buy-chip">✨ {chip}</span>}
+                  {evolve && <span className="buy-chip evolve">✨ {evolve}</span>}
+                </p>
+              )}
+              <h2>商品説明</h2>
+              <p className="desc">{item.description || "（説明なし）"}</p>
+              <div className="buy">
+                {/* スマホでは画面の下に固定（下部タブの上） */}
+                <div className={canBuy ? "buy-bar" : ""}>
+                  {hidden ? null : item.status === "sold" ? (
+                    <button className="primary" disabled>
+                      売り切れ
+                    </button>
+                  ) : mine ? (
+                    <p className="muted">あなたが出品した商品です</p>
+                  ) : state.status === "ready" ? (
+                    <button className="primary" onClick={() => onBuy(item)}>
+                      購入する
+                    </button>
+                  ) : state.status === "signedOut" ? (
+                    <button className="primary" onClick={login}>
+                      ログインして購入
+                    </button>
+                  ) : null}
+                </div>
+                {!hidden && state.status === "ready" && item.seller && item.seller.id !== state.me.id && (
+                  <StartChatButton itemId={item.id} onChat={onChat} label="💬 メッセージを送る" />
+                )}
+              </div>
+            </div>
+            {!hidden && (state.status === "ready" || state.status === "signedOut") && (
+              <div className="panel detail-extra">
+                <AskBox itemId={item.id} />
+              </div>
             )}
           </div>
         </article>
+      )}
+      {item && !hidden && (recs.length > 0 || rail.loading || rail.error) && (
+        <div className="panel detail-recs">
+          <RecRail
+            title="あなたへのおすすめ"
+            sub={detailRecSub(recs.map((r) => r.reason.kind))}
+            recs={recs}
+            {...rail}
+            onOpen={onOpen}
+            onLike={onLike}
+            onMessage={onMessage}
+            small
+          />
+        </div>
       )}
     </section>
   );
@@ -942,7 +1772,7 @@ function FigureMaker({ item, myId, onSaved }: { item: Item; myId: string | null;
       const saved = await saveFigure(item.id, figure);
       setFigure(saved);
       setUnsaved(false);
-      setSavedMsg("保存しました。マイページの「箱庭」に並びます");
+      setSavedMsg("保存しました。ホームの箱庭に並びます");
       onSaved(saved);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1001,7 +1831,7 @@ function FigureMaker({ item, myId, onSaved }: { item: Item; myId: string | null;
   );
 }
 
-// ---- 購入確認 ----
+// ---- 購入確認（A-1）：左に「購入商品」、右に「支払いサマリー」。住所・決済の欄は無い（決済はしない） ----
 function BuyConfirm({ item, onDone, onCancel }: { item: Item; onDone: (item: Item) => void; onCancel: () => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1019,66 +1849,153 @@ function BuyConfirm({ item, onDone, onCancel }: { item: Item; onDone: (item: Ite
     }
   };
 
+  const chip = confirmChipText(item);
   return (
-    <section>
-      <h1>購入内容の確認</h1>
-      <div className="confirm">
-        <Thumb item={item} />
-        <div>
-          <p className="title">{item.title}</p>
-          <p className="muted">出品者: {item.seller ? item.seller.display_name : "（見本データ）"}</p>
-          <p className="price big">{yen(item.price)}</p>
+    <section className="buy-flow">
+      <h1 className="page-title">購入内容の確認</h1>
+      <p className="muted page-sub">内容を確認して購入を確定してください</p>
+      <div className="confirm-grid">
+        <div className="panel confirm-item">
+          <span className="card-label">購入商品</span>
+          <div className="confirm">
+            <Thumb item={item} photoFirst />
+            <div>
+              <p className="title">{item.title}</p>
+              <p className="seller">
+                <span className="avatar" aria-hidden>
+                  {item.seller ? initialOf(item.seller.display_name) : "見"}
+                </span>
+                出品者 {item.seller ? item.seller.display_name : "（見本データ）"}
+              </p>
+              <p className="price big">{yen(item.price)}</p>
+            </div>
+          </div>
         </div>
-      </div>
-      <p className="muted">このアプリでは支払いは発生しません。受け渡しは出品者とメッセージで相談します。</p>
-      {error && <p className="err">{error}</p>}
-      <div className="actions">
-        <button type="button" className="ghost" onClick={onCancel} disabled={busy}>
-          戻る
-        </button>
-        <button className="primary" onClick={onBuy} disabled={busy}>
-          {busy ? "購入中…" : "購入する"}
-        </button>
+        <div className="panel summary">
+          <h2 className="panel-title">支払いサマリー</h2>
+          <dl className="sum-rows">
+            <div>
+              <dt>商品代金</dt>
+              <dd>{yen(item.price)}</dd>
+            </div>
+            <div className="sum-total">
+              <dt>合計</dt>
+              <dd>{yen(item.price)}</dd>
+            </div>
+          </dl>
+          {chip && <p className="buy-chip wide">🎁 {chip}</p>}
+          {error && <p className="err">{error}</p>}
+          <button className="primary big-btn" onClick={onBuy} disabled={busy}>
+            {busy ? "購入中…" : "購入を確定する"}
+          </button>
+          <button type="button" className="outline big-btn" onClick={onCancel} disabled={busy}>
+            戻る
+          </button>
+          <small className="muted">このアプリでは支払いは発生しません。受け渡しは出品者とメッセージで相談します。</small>
+        </div>
       </div>
     </section>
   );
 }
 
-// ---- 購入完了 ----
+// ---- 購入完了（A-1）：上に完了のカード、左に「箱庭に仲間入り！」（買った物の写真＋NEW と購入後のレベル）、右に「つぎはこれ」3件 ----
+// 箱庭の 3D は重いので出さず、買った商品の写真で見せる。レベルは購入後の数（countAfterBuy）で計算する。
 function Bought({
   item,
+  garden,
+  gardenError,
   onMypage,
   onList,
   onChat,
+  recs,
+  rail,
+  onOpen,
+  onLike,
+  onMessage,
 }: {
   item: Item;
+  garden: GardenData | null;
+  gardenError: string;
   onMypage: () => void;
   onList: () => void;
   onChat: (conv: Conversation) => void;
+  recs: Rec[];
+  rail: RailState;
+  onOpen: (id: string) => void;
+  onLike: (id: string, s: LikeState) => void;
+  onMessage: (msg: string) => void;
 }) {
+  const after = garden ? countAfterBuy(garden.entries, item) : 0;
+  const level = gardenLevel(after);
+  const joins = !!item.figure; // 模型のある物だけが箱庭に並ぶ
   return (
-    <section>
-      <h1>購入しました</h1>
-      <p>
-        「{item.title}」（{yen(item.price)}）を購入しました。
-      </p>
-      <p className="muted">受け渡しの方法は、出品者とのメッセージで決めましょう。</p>
-      {item.seller && <StartChatButton itemId={item.id} onChat={onChat} label="出品者にメッセージ" />}
-      <div className="actions">
-        <button className="ghost" onClick={onList}>
-          一覧へ
-        </button>
-        <button className="primary" onClick={onMypage}>
-          マイページで確認
-        </button>
+    <section className="buy-flow">
+      <div className="panel done-card">
+        <span className="done-check" aria-hidden>
+          ✓
+        </span>
+        <div className="done-main">
+          <h1>購入が完了しました！</h1>
+          <p className="muted">{item.title}を購入しました。受け渡しの方法は、出品者とのメッセージで決めましょう。</p>
+          <div className="done-actions">
+            {item.seller && <StartChatButton itemId={item.id} onChat={onChat} label="💬 出品者にメッセージ" />}
+            <button className="link" onClick={onMypage}>
+              マイページで確認 →
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="done-grid">
+        <div className="panel done-garden">
+          <h2 className="panel-title">{joins ? "✨ 箱庭に仲間入り！" : "買った商品"}</h2>
+          <div className="done-photo">
+            <Thumb item={item} className="thumb" photoFirst />
+            {joins && <span className="garden-new">NEW</span>}
+          </div>
+          <LevelCard count={after} known={garden !== null} failed={gardenError !== ""} />
+          <small className="muted">
+            {joins
+              ? "模型がホームの箱庭に並びます。"
+              : item.photo_image_id
+                ? "商品ページで写真から模型をつくると、箱庭に並びます。"
+                : "この商品は写真が無いので、模型はつくれません。"}
+          </small>
+        </div>
+        <div className="panel done-next">
+          <RecRail
+            title="💡 つぎはこれ"
+            sub={garden && level.next ? `あなたへのおすすめ・実在の出品（あと${level.toNext}個で ${level.next.name}）` : "あなたへのおすすめ・実在の出品"}
+            recs={recs}
+            {...rail}
+            onOpen={onOpen}
+            onLike={onLike}
+            onMessage={onMessage}
+            small
+          />
+          <button className="outline back-top" onClick={onList}>
+            トップへ戻る
+          </button>
+        </div>
       </div>
     </section>
   );
 }
 
-// ---- マイページ（出品した商品・購入した商品・いいねした商品） ----
-function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; onGarden: () => void; onLogout: () => void }) {
-  const [tab, setTab] = useState<"selling" | "bought" | "likes">("selling");
+// ---- マイページ（A-1）：上にプロフィールカード（頭文字・表示名・件数・箱庭の案内）、
+//      下に「出品中」「購入した商品」「売れた商品」、その下に「いいねした商品」、右下にログアウト ----
+function MyPage({
+  name,
+  garden,
+  onOpen,
+  onGarden,
+  onLogout,
+}: {
+  name: string;
+  garden: GardenState;
+  onOpen: (id: string) => void;
+  onGarden: () => void;
+  onLogout: () => void;
+}) {
   const [mine, setMine] = useState<Item[] | null>(null);
   const [bought, setBought] = useState<Purchase[] | null>(null);
   const [likes, setLikes] = useState<Item[] | null>(null);
@@ -1092,175 +2009,170 @@ function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; 
         setBought(b);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-    // いいねは別に読む（読めなくても、出品・購入のタブは使える）
+    // いいねは別に読む（読めなくても、出品・購入の区分は使える）
     listMyLikes()
       .then(setLikes)
       .catch((e) => setLikesError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  const rows = tab === "selling" ? mine : tab === "likes" ? likes : (bought?.map((p) => ({ ...p.item, price: p.price })) ?? null);
-  const tabError = tab === "likes" ? likesError : error;
-  const empty = { selling: "まだ出品していません", bought: "まだ購入していません", likes: "まだいいねした商品はありません。商品の ♡ を押すと、ここに並びます" };
+  const sections = mine && bought ? mySections(mine, bought) : null;
+  const counts = sections ? myCounts(sections) : null;
+  const entries = garden.data?.entries ?? [];
+  const level = garden.data ? gardenLevel(entries.length) : null;
+  // 小さな箱庭：模型の画像がある物を新しい順に3つまで（無ければ芽だけ）
+  const minis = entries
+    .slice()
+    .reverse()
+    .map((e) => garden.data?.items[e.id])
+    .filter((it): it is Item => !!it && !!it.figure_image_id)
+    .slice(0, 3);
 
   return (
-    <section>
-      <div className="mypage-head">
-        <h1>マイページ</h1>
-        <button className="primary small" onClick={onGarden}>
-          🌱 箱庭を見る
-        </button>
-        <button className="ghost small" onClick={onLogout}>
+    <section className="mypage">
+      <div className="panel my-profile">
+        <div className="my-who">
+          <span className="avatar huge" aria-hidden>
+            {initialOf(name)}
+          </span>
+          <div className="my-name">
+            <h1>{name || "マイページ"}</h1>
+            <div className="my-counts" aria-label="件数">
+              {(["bought", "sold", "selling"] as const).map((k) => (
+                <span key={k} className={`my-count my-count-${k}`}>
+                  <small>{TAG_TEXT[k]}</small>
+                  <b>{counts ? counts[k] : "–"}</b>
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="my-garden">
+          <button type="button" className="mini-garden" onClick={onGarden} aria-label="箱庭を見る">
+            {minis.length > 0 ? minis.map((it) => <Thumb key={it.id} item={it} className="mini-fig" />) : <span className="mini-sprout">🌱</span>}
+          </button>
+          <div className="my-garden-text">
+            {level ? (
+              <>
+                <b className="my-lv">Lv.{level.lv}</b>
+                <b className="my-lv-name">{level.name}</b>
+                <small className="muted">{level.next ? `あと${level.toNext}個で ${level.next.name}` : "いちばん大きな島になりました"}</small>
+              </>
+            ) : (
+              <small className="muted">{garden.error ? "箱庭を読み込めませんでした" : "箱庭を読み込み中…"}</small>
+            )}
+            <button className="primary" onClick={onGarden}>
+              箱庭を見る
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {error && <p className="err">{error}</p>}
+      <div className="my-sections">
+        <MySection title="出品中" tone="selling" items={sections?.selling ?? null} failed={!!error} empty="まだ出品していません" showModeration onOpen={onOpen} />
+        <MySection title="購入した商品" tone="bought" items={sections?.bought ?? null} failed={!!error} empty="まだ購入していません" onOpen={onOpen} />
+        <MySection title="売れた商品" tone="sold" items={sections?.sold ?? null} failed={!!error} empty="まだ売れた商品はありません" onOpen={onOpen} />
+      </div>
+      {likesError && <p className="err">{likesError}</p>}
+      <MySection
+        title="いいねした商品"
+        tone="likes"
+        items={likes}
+        failed={!!likesError}
+        empty="まだいいねした商品はありません。商品の ♡ を押すと、ここに並びます"
+        wide
+        onOpen={onOpen}
+      />
+      <div className="my-foot">
+        <button className="outline" onClick={onLogout}>
           ログアウト
         </button>
       </div>
-      <div className="tabs" role="tablist">
-        <button role="tab" aria-selected={tab === "selling"} className={tab === "selling" ? "on" : ""} onClick={() => setTab("selling")}>
-          出品した商品{mine && `（${mine.length}）`}
-        </button>
-        <button role="tab" aria-selected={tab === "bought"} className={tab === "bought" ? "on" : ""} onClick={() => setTab("bought")}>
-          購入した商品{bought && `（${bought.length}）`}
-        </button>
-        <button role="tab" aria-selected={tab === "likes"} className={tab === "likes" ? "on" : ""} onClick={() => setTab("likes")}>
-          いいね{likes && `（${likes.length}）`}
-        </button>
-      </div>
-      {tabError && <p className="err">{tabError}</p>}
-      {rows === null && !tabError && <p className="muted">読み込み中…</p>}
-      {rows?.length === 0 && <p className="muted">{empty[tab]}</p>}
-      <ul className="rows">
-        {rows?.map((it) => (
-          <li key={it.id}>
-            <button className="row" onClick={() => onOpen(it.id)}>
-              <Thumb item={it} className="thumb small" />
-              <span className="title">
-                {tab === "selling" && it.moderation_status === "review" && <span className="mod-tag">確認中</span>}
-                {tab === "selling" && it.moderation_status === "hidden" && <span className="mod-tag hidden">非公開</span>}
-                {it.title}
-              </span>
-              <span className="price">{yen(it.price)}</span>
-              {it.figure && <span className="badge figure-badge" title="模型あり">🧸</span>}
-              {tab === "selling" && <span className={it.status === "sold" ? "badge sold-badge" : "badge"}>{it.status === "sold" ? "売れました" : "出品中"}</span>}
-            </button>
-          </li>
-        ))}
-      </ul>
     </section>
   );
 }
 
-// ---- 箱庭（売った物・買った物の模型を1つの島に並べる。数が増えると島が育つ） ----
-const TIME_MODES: ("now" | TimeOfDay)[] = ["now", "morning", "day", "evening", "night"];
-const VERB: Record<GardenEntry["tag"], string> = { sold: "売った", bought: "買った", selling: "出品した" };
+// マイページの区分1つ（写真カードの並び。売れた物には SOLD）。件数の丸はタグと同じ色（いいねは赤）
+function MySection({
+  title,
+  tone,
+  items,
+  failed,
+  empty,
+  showModeration = false,
+  wide = false,
+  onOpen,
+}: {
+  title: string;
+  tone: "selling" | "bought" | "sold" | "likes";
+  items: Item[] | null;
+  failed: boolean;
+  empty: string;
+  showModeration?: boolean;
+  wide?: boolean;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <section className={`panel my-section ${wide ? "wide" : ""}`} aria-label={title}>
+      <div className="my-section-head">
+        <h2 className="panel-title">{title}</h2>
+        {items && <span className={`my-badge my-count-${tone}`}>{items.length}</span>}
+      </div>
+      {items === null ? (
+        !failed && <p className="muted">読み込み中…</p>
+      ) : items.length === 0 ? (
+        <p className="muted">{empty}</p>
+      ) : (
+        <ul className="my-grid">
+          {items.map((it) => (
+            <li key={it.id}>
+              <button className="my-card" onClick={() => onOpen(it.id)}>
+                <span className="my-photo">
+                  <Thumb item={it} photoFirst />
+                  {/* 買った物も API では sold なので、「購入した商品」には付けない（SOLD は売れた商品と、いいねした物の売り切れ） */}
+                  {tone !== "bought" && it.status === "sold" && <span className="sold-mark">SOLD</span>}
+                </span>
+                <span className="title">
+                  {showModeration && it.moderation_status === "review" && <span className="mod-tag">確認中</span>}
+                  {showModeration && it.moderation_status === "hidden" && <span className="mod-tag hidden">非公開</span>}
+                  {it.title}
+                </span>
+                <span className="price">{yen(it.price)}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
 
-function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () => void }) {
-  const { state } = useAuth();
-  const myId = state.status === "ready" ? state.me.id : "";
-  const [data, setData] = useState<{ entries: GardenEntry[]; missing: Item[]; fresh: number } | null>(null);
-  const [error, setError] = useState("");
-  const [timeMode, setTimeMode] = useState<"now" | TimeOfDay>("now");
+// ---- 箱庭（A-1）：左（2fr）に大きな島、右（1fr）にレベルカード（時間帯つき）と集めたフィギュア。
+//      並べ直し・記念撮影・紹介カード・模型がまだの商品は前のまま。データはホームと同じ useGarden ----
+function Garden({
+  garden,
+  time,
+  onTime,
+  onOpen,
+  backLabel,
+  onBack,
+}: {
+  garden: GardenState;
+  time: TimeOfDay;
+  onTime: (t: TimeOfDay) => void;
+  onOpen: (id: string) => void;
+  backLabel: string;
+  onBack: () => void;
+}) {
+  const { data, error } = garden;
   const [selected, setSelected] = useState<string | null>(null);
   const [shotMsg, setShotMsg] = useState("");
-  const [layoutMsg, setLayoutMsg] = useState("");
   const handle = useRef<GardenHandle | null>(null);
-  // 配置の保存：最新の並びを ref に持ち、保存は1本ずつ順番に送る（並べ直しと重なっても、押した順に届く）
-  const entriesRef = useRef<GardenEntry[]>([]);
-  const saveTimer = useRef(0);
-  const dirty = useRef(false);
-  const saving = useRef<Promise<void>>(Promise.resolve());
-  const mounted = useRef(true);
-  const [nowTime] = useState<TimeOfDay>(() => timeOfDayAt(new Date())); // 開いたときの時間帯
 
-  useEffect(() => {
-    if (!myId) return;
-    // 配置が読めなくても（表がまだ無いなど）箱庭は出す。そのときはマス目に並ぶ
-    Promise.all([listMyItems(), listMyPurchases(), getGarden().catch(() => [])])
-      .then(([mine, bought, spots]) => {
-        const spotOf = new Map(spots.map((s) => [s.item_id, { x: s.x, z: s.z }]));
-        // 古い順に並べる（思い出が積もっていく順）
-        const all = [
-          ...mine.map((it) => ({ it, tag: (it.status === "sold" ? "sold" : "selling") as GardenEntry["tag"], at: it.created_at, price: it.price })),
-          ...bought.map((p) => ({ it: p.item, tag: "bought" as GardenEntry["tag"], at: p.created_at, price: p.price })),
-        ].sort((a, b) => a.at.localeCompare(b.at));
-        const seen = loadSeen(myId);
-        const entries: GardenEntry[] = [];
-        const missing: Item[] = [];
-        const ids = new Set<string>();
-        for (const { it, tag, at, price } of all) {
-          if (ids.has(it.id)) continue;
-          ids.add(it.id);
-          if (it.figure)
-            entries.push({ id: it.id, title: it.title, figure: it.figure, tag, at, price, isNew: seen !== null && !seen.has(it.id), spot: spotOf.get(it.id) });
-          else missing.push(it);
-        }
-        saveSeen(myId, entries.map((e) => e.id));
-        entriesRef.current = entries;
-        setData({ entries, missing, fresh: entries.filter((e) => e.isNew).length });
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, [myId]);
-
-  const time: TimeOfDay = timeMode === "now" ? nowTime : timeMode;
   const count = (tag: GardenEntry["tag"]) => data?.entries.filter((e) => e.tag === tag).length ?? 0;
   const level = gardenLevel(data?.entries.length ?? 0);
   const sel = data?.entries.find((e) => e.id === selected);
   const [skyTop, skyBottom] = SKY_COLORS[time];
-
-  const say = (msg: string) => {
-    if (mounted.current) setLayoutMsg(msg);
-  };
-  // 保存を列の最後に積む（前の保存が終わってから送る）
-  const enqueueSave = (spots: { item_id: string; x: number; z: number }[], done: string) => {
-    saving.current = saving.current
-      .then(() => saveGarden(spots))
-      .then(() => say(done))
-      .catch((err) => say(err instanceof Error ? err.message : String(err)));
-  };
-  // まだ送っていない移動があれば、すぐ保存する
-  const flush = () => {
-    clearTimeout(saveTimer.current);
-    if (!dirty.current) return;
-    dirty.current = false;
-    const spots = entriesRef.current.filter((e) => e.spot).map((e) => ({ item_id: e.id, x: e.spot!.x, z: e.spot!.z }));
-    enqueueSave(spots, "配置を保存しました");
-  };
-  const flushRef = useRef(flush);
-  useEffect(() => {
-    flushRef.current = flush;
-  });
-  // 画面を離れるとき・タブを隠したときも、動かした直後の分を送る
-  useEffect(() => {
-    mounted.current = true;
-    const onHide = () => flushRef.current();
-    window.addEventListener("pagehide", onHide);
-    document.addEventListener("visibilitychange", onHide);
-    return () => {
-      window.removeEventListener("pagehide", onHide);
-      document.removeEventListener("visibilitychange", onHide);
-      flushRef.current();
-      mounted.current = false;
-    };
-  }, []);
-
-  // 動かした場所を覚え、少し待ってからまとめて保存する（続けて動かしても保存は1回）
-  function onMove(id: string, x: number, z: number) {
-    const e = entriesRef.current.find((x) => x.id === id);
-    if (e) e.spot = { x, z }; // 描き直し（時間帯の切り替えなど）でも、動かした場所に残す
-    dirty.current = true;
-    setLayoutMsg("");
-    clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(flush, 700);
-  }
-
-  // 並べ直し：動かした場所を消して、マス目に戻す
-  function resetLayout() {
-    clearTimeout(saveTimer.current);
-    dirty.current = false;
-    const fresh = entriesRef.current.map((e) => ({ ...e, spot: undefined }));
-    entriesRef.current = fresh;
-    setData((d) => (d ? { ...d, entries: fresh } : d));
-    setSelected(null);
-    enqueueSave([], "きれいに並べ直しました");
-  }
 
   function takePhoto() {
     const url = handle.current?.snapshot();
@@ -1276,106 +2188,102 @@ function Garden({ onOpen, onBack }: { onOpen: (id: string) => void; onBack: () =
   }
 
   return (
-    <section>
-      <button className="ghost" onClick={onBack}>
-        ← マイページへ
+    <section className="garden-page">
+      <button className="ghost small back" onClick={onBack}>
+        {backLabel}
       </button>
-      <h1>箱庭</h1>
-      {error && <p className="err">{error}</p>}
+      {error && (
+        <div className="garden-msg">
+          <p className="err">{error}</p>
+          <button className="ghost small" onClick={garden.reload}>
+            もう一度読み込む
+          </button>
+        </div>
+      )}
       {!data && !error && <p className="muted">読み込み中…</p>}
       {data && (
         <>
-          <div className="garden-level">
-            <div className="garden-level-head">
-              <span className="garden-lv">Lv{level.lv}</span>
-              <b>{level.name}</b>
-              {data.fresh > 0 && <span className="garden-new">新しく {data.fresh} 個並びました</span>}
-            </div>
-            <div className="garden-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(level.progress * 100)}>
-              <i style={{ width: `${Math.round(level.progress * 100)}%` }} />
-            </div>
-            <small className="muted">
-              {level.next
-                ? `あと ${level.toNext} 個で Lv${level.lv + 1}「${level.next.name}」（${level.next.unlock}が増えます）`
-                : "いちばん大きな島になりました"}
-              ・売った物 {count("sold")}・買った物 {count("bought")}・出品中 {count("selling")}
-            </small>
-          </div>
-
-          {data.entries.length > 0 ? (
-            <>
-              <div className="garden-tools">
-                <div className="chips" role="group" aria-label="時間帯">
-                  {TIME_MODES.map((m) => (
-                    <button key={m} className={timeMode === m ? "chip on" : "chip"} onClick={() => setTimeMode(m)}>
-                      {m === "now" ? `いま（${TIME_TEXT[nowTime]}）` : TIME_TEXT[m]}
-                    </button>
-                  ))}
+          <div className="garden-layout">
+            <section className="panel garden-main" aria-labelledby="garden-title">
+              <div className="garden-main-head">
+                <div>
+                  <h1 id="garden-title" className="panel-title garden-title">
+                    箱庭 <span className="dash">―</span> {level.name}
+                  </h1>
+                  <span className="muted">いまは{TIME_TEXT[time]}</span>
                 </div>
-                <div className="chips">
-                  <button className="ghost small" onClick={resetLayout}>
-                    きれいに並べ直す
-                  </button>
-                  <button className="ghost small" onClick={takePhoto}>
-                    📸 記念撮影
-                  </button>
-                </div>
+                {data.entries.length > 0 && <span className="hint-chip">✋ ドラッグで並び替えできるよ</span>}
               </div>
-              <div className="garden-card" style={{ background: `linear-gradient(${skyTop}, ${skyBottom})` }}>
-                <ErrorBoundary fallback={<p className="muted">箱庭を表示できませんでした</p>}>
-                  <Suspense fallback={<p className="muted">箱庭を準備中…</p>}>
-                    <Garden3D entries={data.entries} time={time} selectedId={selected} onSelect={setSelected} onMove={onMove} handleRef={handle} />
-                  </Suspense>
-                </ErrorBoundary>
-                {sel && (
-                  <div className="garden-info">
-                    <div className="garden-info-head">
-                      <span className="badge" style={{ background: TAG_COLOR[sel.tag], color: "#fff" }}>
-                        {TAG_TEXT[sel.tag]}
-                      </span>
-                      <b>{sel.title}</b>
-                    </div>
-                    {sel.figure.caption && <p>{sel.figure.caption}</p>}
-                    <p className="muted">
-                      {yen(sel.price)}・{new Date(sel.at).toLocaleDateString("ja-JP")} に{VERB[sel.tag]}
-                    </p>
-                    <div className="garden-info-actions">
-                      <button className="primary small" onClick={() => onOpen(sel.id)}>
-                        商品を見る
+              {data.entries.length > 0 ? (
+                <>
+                  <div className="garden-card" style={{ background: `linear-gradient(${skyTop}, ${skyBottom})` }}>
+                    <ErrorBoundary fallback={<p className="garden-msg muted">箱庭を表示できませんでした</p>}>
+                      <Suspense fallback={<p className="garden-msg muted">箱庭を準備中…</p>}>
+                        <Garden3D entries={data.entries} time={time} selectedId={selected} onSelect={setSelected} onMove={garden.onMove} handleRef={handle} />
+                      </Suspense>
+                    </ErrorBoundary>
+                    {sel && <GardenInfo entry={sel} onOpen={() => onOpen(sel.id)} onClose={() => setSelected(null)} />}
+                  </div>
+                  <div className="garden-tools">
+                    <small className="muted garden-help">
+                      模型をつかんで好きな場所へ動かせます（自動で保存）。何もない所のドラッグで回す・上下で角度、ホイールか2本指でズーム。模型をタップすると紹介します。
+                    </small>
+                    <div className="chips">
+                      <button className="ghost small" onClick={() => { setSelected(null); garden.resetLayout(); }}>
+                        きれいに並べ直す
                       </button>
-                      <button className="ghost small" onClick={() => setSelected(null)}>
-                        閉じる
+                      <button className="ghost small" onClick={takePhoto}>
+                        📸 記念撮影
                       </button>
                     </div>
                   </div>
+                  {garden.layoutMsg && <p className={garden.layoutMsg.endsWith("しました") ? "ok" : "err"}>{garden.layoutMsg}</p>}
+                  {shotMsg && <p className="ok">{shotMsg}</p>}
+                </>
+              ) : (
+                <p className="garden-empty">
+                  まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
+                </p>
+              )}
+            </section>
+
+            <div className="garden-side">
+              <LevelCard count={data.entries.length} known failed={false}>
+                {level.next && (
+                  <small className="muted">
+                    Lv.{level.lv + 1} になると{level.next.unlock}が増えます
+                  </small>
                 )}
-              </div>
-              <p className="muted garden-help">
-                模型をつかんで好きな場所へ動かせます（自動で保存）。何もない所のドラッグで回す・上下で角度、ホイールか2本指でズーム。模型をタップすると紹介します。
-              </p>
-              {layoutMsg && <p className={layoutMsg.endsWith("しました") ? "ok" : "err"}>{layoutMsg}</p>}
-              {shotMsg && <p className="ok">{shotMsg}</p>}
-            </>
-          ) : (
-            <p className="garden-empty">
-              まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
-            </p>
-          )}
+                {garden.fresh > 0 && <span className="garden-new fresh">新しく {garden.fresh} 個並びました</span>}
+                <div className="level-time">
+                  <span className="muted">時間帯</span>
+                  <TimeToggle time={time} onChange={onTime} />
+                </div>
+                <small className="muted">
+                  売った物 {count("sold")}・買った物 {count("bought")}・出品中 {count("selling")}
+                </small>
+              </LevelCard>
+              <FigureList data={data} signedOut={false} loading={false} error="" onOpen={onOpen} />
+            </div>
+          </div>
+
           {data.missing.length > 0 && (
-            <>
-              <h2>模型がまだの商品</h2>
+            <section className="panel garden-missing">
+              <h2 className="panel-title">模型がまだの商品</h2>
               <ul className="rows">
                 {data.missing.map((it) => (
                   <li key={it.id}>
                     <button className="row" onClick={() => onOpen(it.id)}>
                       <Thumb item={it} className="thumb small" />
-                      <span className="title">{it.title}</span>
-                      <span className="muted">{it.photo_image_id ? "開いて模型をつくる" : "写真がないので模型はつくれません"}</span>
+                      <span className="row-main">
+                        <span className="title">{it.title}</span>
+                        <small className="muted">{it.photo_image_id ? "開いて模型をつくる" : "写真がないので模型はつくれません"}</small>
+                      </span>
                     </button>
                   </li>
                 ))}
               </ul>
-            </>
+            </section>
           )}
         </>
       )}
@@ -1407,65 +2315,160 @@ function StartChatButton({ itemId, onChat, label }: { itemId: string; onChat: (c
   );
 }
 
-const shortTime = (iso: string) =>
-  new Date(iso).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+// 会話の一覧を読み直す間隔（会話の中の新着は POLL_MS ごと）
+const LIST_POLL_MS = 15000;
 
-// ---- メッセージ一覧 ----
-function Inbox({ onOpen }: { onOpen: (conv: Conversation) => void }) {
+// ---- メッセージ（A-1）：左に会話の一覧、右に開いた会話 ----
+// PC（761px 以上）は2カラムで同時に出し、スマホは今までどおり 一覧 → 会話 の2段階（CSS で片方だけ出す）。
+// 一覧に出すのは API にある物だけ：相手の名前・商品（写真）・最新のメッセージ・その時刻（「5分前」の形）。
+// 未読の数と相手のアイコン画像は API に無いので出さない（アイコンは商品の写真か、相手の頭文字）。
+function Messages({
+  conv,
+  onOpen,
+  onBack,
+  onItem,
+  onBuy,
+}: {
+  conv: Conversation | null;
+  onOpen: (conv: Conversation) => void;
+  onBack: () => void;
+  onItem: (id: string) => void;
+  onBuy: (item: Item) => void;
+}) {
   const [convs, setConvs] = useState<Conversation[] | null>(null);
   const [error, setError] = useState("");
   const { state } = useAuth();
   const myId = state.status === "ready" ? state.me.id : "";
+  const now = useNow();
 
+  // 一覧は、開いた会話が変わるたび（一覧へ戻ったときも）と、LIST_POLL_MS ごとに読み直す
+  // （ほかの相手からの新着・新しく始まった会話を、メッセージ画面を出なくても一覧に出すため）。
+  // 読み直しの失敗は、もう一覧が出ていれば黙って次を待つ（一度読めた一覧を消さない）
+  const convId = conv?.id ?? "";
+  const loaded = useRef(false);
   useEffect(() => {
-    listConversations()
-      .then(setConvs)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+    let alive = true;
+    const load = () =>
+      listConversations()
+        .then((cs) => {
+          if (!alive) return;
+          loaded.current = true;
+          setConvs(cs);
+          setError("");
+        })
+        .catch((e) => {
+          if (alive && !loaded.current) setError(e instanceof Error ? e.message : String(e));
+        });
+    load();
+    const t = window.setInterval(load, LIST_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [convId]);
+
+  // 詳細の「メッセージを送る」から来た新しい会話は、一覧に無ければ先頭に足して出す
+  const list = convs && conv && !convs.some((c) => c.id === conv.id) ? [conv, ...convs] : convs;
+  // 会話で送った・届いた最新のメッセージを、一覧の「最新のメッセージ」にも映す。
+  // 一覧にまだ無い会話（詳細から始めたばかり）は、そのメッセージを付けて先頭に足す
+  const onLatest = (c0: Conversation, m: Message) =>
+    setConvs((cs) => {
+      if (!cs) return cs;
+      if (!cs.some((c) => c.id === c0.id)) return [{ ...c0, last_message: m }, ...cs];
+      return cs.map((c) => (c.id === c0.id && (!c.last_message || c.last_message.id < m.id) ? { ...c, last_message: m } : c));
+    });
 
   return (
-    <section>
-      <h1>メッセージ</h1>
-      {error && <p className="err">{error}</p>}
-      {convs === null && !error && <p className="muted">読み込み中…</p>}
-      {convs?.length === 0 && <p className="muted">まだやりとりはありません。商品ページの「出品者にメッセージ」から始められます。</p>}
-      <ul className="rows">
-        {convs?.map((c) => (
-          <li key={c.id}>
-            <button className="row conv" onClick={() => onOpen(c)}>
-              <Thumb item={c.item} className="thumb small" />
-              <span className="conv-main">
-                <span className="title">
-                  {c.partner.display_name} <small className="muted">・{c.item.title}</small>
+    <section className={`dm ${conv ? "dm-open" : ""}`}>
+      <div className="panel dm-list">
+        <h1 className="dm-title">メッセージ</h1>
+        {error && <p className="err">{error}</p>}
+        {list === null && !error && <p className="muted">読み込み中…</p>}
+        {list?.length === 0 && <p className="muted">まだやりとりはありません。商品ページの「メッセージを送る」から始められます。</p>}
+        <ul className="dm-convs">
+          {list?.map((c) => (
+            <li key={c.id}>
+              <button className={`dm-conv ${conv?.id === c.id ? "on" : ""}`} onClick={() => onOpen(c)} aria-current={conv?.id === c.id ? "true" : undefined}>
+                <ConvIcon item={c.item} name={c.partner.display_name} />
+                <span className="dm-conv-main">
+                  <b className="dm-name">{c.partner.display_name}さん</b>
+                  <span className="muted preview">
+                    {c.item.title}・{previewText(c.last_message, myId)}
+                  </span>
                 </span>
-                <span className="muted preview">
-                  {c.last_message
-                    ? `${c.last_message.sender_id === myId ? "あなた: " : ""}${c.last_message.body}`
-                    : "（まだメッセージはありません）"}
-                </span>
-              </span>
-              <span className="muted when">{c.last_message ? shortTime(c.last_message.created_at) : ""}</span>
-            </button>
-          </li>
-        ))}
-      </ul>
+                {c.last_message && <span className="muted when">{relativeTime(c.last_message.created_at, now)}</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="dm-pane">
+        {conv ? (
+          <Chat key={conv.id} conv={conv} myId={myId} now={now} onBack={onBack} onItem={onItem} onBuy={onBuy} onLatest={(m) => onLatest(conv, m)} />
+        ) : (
+          <div className="panel dm-empty">
+            <p className="muted">左の一覧から、やりとりを選んでください。</p>
+          </div>
+        )}
+      </div>
     </section>
   );
+}
+
+// 会話のアイコン：商品の写真があれば丸く、無ければ相手の頭文字
+function ConvIcon({ item, name }: { item: Item; name: string }) {
+  const id = item.photo_image_id || item.figure_image_id;
+  if (id) return <img className="dm-icon" src={imageUrl(id)} alt="" loading="lazy" />;
+  return (
+    <span className="dm-icon avatar" aria-hidden>
+      {initialOf(name)}
+    </span>
+  );
+}
+
+// 「5分前」の表示を1分ごとに進めるための今の時刻
+function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(t);
+  }, []);
+  return now;
 }
 
 // ---- メッセージ（やりとり1つ） ----
 // 新しいメッセージは5秒ごとに after=<最後の ID> で取りに行く（ポーリング）。
 const POLL_MS = 5000;
 
-function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void; onItem: (id: string) => void }) {
-  const { state } = useAuth();
-  const myId = state.status === "ready" ? state.me.id : "";
+function Chat({
+  conv,
+  myId,
+  now,
+  onBack,
+  onItem,
+  onBuy,
+  onLatest,
+}: {
+  conv: Conversation;
+  myId: string;
+  now: number;
+  onBack: () => void;
+  onItem: (id: string) => void;
+  onBuy: (item: Item) => void;
+  onLatest: (m: Message) => void;
+}) {
   const [msgs, setMsgs] = useState<Message[] | null>(null);
   const [body, setBody] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const lastId = useRef("");
+  const box = useRef<HTMLDivElement>(null);
   const bottom = useRef<HTMLDivElement>(null);
+  // 一覧へ知らせる関数は描画のたびに変わるので、最新のものを ref に入れておく（ポーリングを張り直さないように）
+  const latestCb = useRef(onLatest);
+  useEffect(() => {
+    latestCb.current = onLatest;
+  });
 
   // 届いたメッセージを足す（同じ ID は1回だけ。送信とポーリングが重なっても二重にならない）
   const append = (more: Message[]) => {
@@ -1476,6 +2479,7 @@ function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void
       lastId.current = next.length ? next[next.length - 1].id : "";
       return next;
     });
+    latestCb.current(more.reduce((a, b) => (a.id < b.id ? b : a)));
   };
 
   useEffect(() => {
@@ -1500,9 +2504,12 @@ function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void
     };
   }, [conv.id]);
 
-  // 新しいメッセージが来たら一番下へ
+  // 新しいメッセージが来たら一番下へ。PC は吹き出しの枠の中だけを動かし（ページ全体は動かさない）、
+  // スマホ（枠が伸びる）はページを下へ
   useEffect(() => {
-    bottom.current?.scrollIntoView({ block: "end" });
+    const el = box.current;
+    if (el && el.scrollHeight > el.clientHeight + 1) el.scrollTop = el.scrollHeight;
+    else bottom.current?.scrollIntoView({ block: "end" });
   }, [msgs?.length]);
 
   const onSend = async (e: FormEvent) => {
@@ -1521,27 +2528,60 @@ function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void
     }
   };
 
+  const item = conv.item;
+  const own = !!myId && item.seller?.id === myId;
+
   return (
-    <section className="chat">
-      <button className="ghost" onClick={onBack}>
+    <div className="panel chat">
+      <button className="ghost small dm-back" onClick={onBack}>
         ← メッセージ一覧
       </button>
-      <div className="chat-head">
-        <h1>{conv.partner.display_name}</h1>
-        <button className="link" onClick={() => onItem(conv.item.id)}>
-          {conv.item.title}（{yen(conv.item.price)}
-          {conv.item.status === "sold" ? "・売り切れ" : ""}）
+      <p className="chat-with">
+        <span className="avatar" aria-hidden>
+          {initialOf(conv.partner.display_name)}
+        </span>
+        {conv.partner.display_name}さんとのやりとり
+      </p>
+      {/* 上の商品カード：写真・商品名・価格・「購入する」（売り切れ・自分の商品なら出さない） */}
+      <div className="dm-item">
+        <button className="dm-item-photo" onClick={() => onItem(item.id)} aria-label={`${item.title}の商品ページ`}>
+          <Thumb item={item} photoFirst />
         </button>
+        <div className="dm-item-main">
+          <button className="link dm-item-title" onClick={() => onItem(item.id)}>
+            {item.title}
+          </button>
+          <span className="price">{yen(item.price)}</span>
+        </div>
+        {chatBuyable(item, myId) ? (
+          <button className="primary small" onClick={() => onBuy(item)}>
+            購入する
+          </button>
+        ) : item.status === "sold" ? (
+          <span className="badge sold-badge">売り切れ</span>
+        ) : own ? (
+          <span className="badge">あなたの出品</span>
+        ) : null}
       </div>
-      <div className="msgs">
+      <div className="msgs" ref={box}>
         {msgs === null && <p className="muted">読み込み中…</p>}
         {msgs?.length === 0 && <p className="muted">最初のメッセージを送ってみましょう（例：受け渡しの場所と日時）。</p>}
-        {msgs?.map((m) => (
-          <div key={m.id} className={m.sender_id === myId ? "msg me" : "msg"}>
-            <p className="bubble">{m.body}</p>
-            <span className="muted when">{shortTime(m.created_at)}</span>
-          </div>
-        ))}
+        {msgs?.map((m) => {
+          const me = m.sender_id === myId;
+          return (
+            <div key={m.id} className={me ? "msg me" : "msg"}>
+              {!me && (
+                <span className="avatar small-avatar" aria-hidden>
+                  {initialOf(conv.partner.display_name)}
+                </span>
+              )}
+              <div className="msg-body">
+                <p className="bubble">{m.body}</p>
+                <span className="muted when">{relativeTime(m.created_at, now)}</span>
+              </div>
+            </div>
+          );
+        })}
         <div ref={bottom} />
       </div>
       {error && <p className="err">{error}</p>}
@@ -1550,8 +2590,9 @@ function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void
           value={body}
           onChange={(e) => setBody(e.target.value)}
           maxLength={MESSAGE_MAX}
-          rows={2}
+          rows={1}
           placeholder="メッセージを入力"
+          aria-label="メッセージ"
           onKeyDown={(e) => {
             // Ctrl+Enter（Mac は ⌘+Enter）で送信
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) onSend(e);
@@ -1561,7 +2602,7 @@ function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void
           送信
         </button>
       </form>
-    </section>
+    </div>
   );
 }
 
@@ -1629,7 +2670,7 @@ function AdminPage({ onOpen }: { onOpen: (id: string) => void }) {
         {items?.map((it) => (
           <li key={it.id} className="admin-row">
             <button className="admin-thumb" onClick={() => onOpen(it.id)} title="商品ページを開く">
-              <Thumb item={it} className="thumb small" />
+              <Thumb item={it} className="thumb small" photoFirst />
             </button>
             <div className="admin-main">
               <button className="link" onClick={() => onOpen(it.id)}>
