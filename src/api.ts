@@ -271,7 +271,9 @@ export async function listMyPurchases(): Promise<Purchase[]> {
 // ---- メッセージ（DM） ----
 
 export type Message = { id: string; sender_id: string; body: string; created_at: string };
-export type Conversation = { id: string; item: Item; partner: Member; last_message: Message | null };
+// unread_count：相手から来た、自分が読んだ位置より新しいメッセージの数（GET /conversations が付ける。
+// 会話を始めた直後の応答などで無いこともあるので省略可。無ければ 0 として扱う）
+export type Conversation = { id: string; item: Item; partner: Member; last_message: Message | null; unread_count?: number };
 export const MESSAGE_MAX = 1000; // バックエンドの usecase/dm.go と同じ
 
 async function dmError(res: Response, fallback: string): Promise<ApiError> {
@@ -316,6 +318,25 @@ export async function sendMessage(conversationId: string, body: string): Promise
   });
   if (!res.ok) throw await dmError(res, "送信に失敗しました");
   return res.json();
+}
+
+// markRead は会話を既読にする（lastMessageId まで。省略すると最新まで）。返り値は既読にした後の自分の未読の合計（ナビの数）。
+export async function markRead(conversationId: string, lastMessageId = ""): Promise<number> {
+  const res = await authFetch(`/conversations/${encodeURIComponent(conversationId)}/read`, {
+    method: "PUT",
+    body: JSON.stringify(lastMessageId ? { last_message_id: lastMessageId } : {}),
+  });
+  if (!res.ok) throw await dmError(res, "既読にできませんでした");
+  const got = (await res.json()) as { unread_count?: number };
+  return typeof got.unread_count === "number" ? got.unread_count : 0;
+}
+
+// getUnread は未読の合計（ナビの 💬 のバッジ）。
+export async function getUnread(): Promise<number> {
+  const res = await authFetch("/me/unread");
+  if (!res.ok) throw await dmError(res, "未読の数の取得に失敗しました");
+  const got = (await res.json()) as { count?: number };
+  return typeof got.count === "number" ? got.count : 0;
 }
 
 export { API_URL };

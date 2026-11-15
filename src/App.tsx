@@ -18,6 +18,8 @@ import {
   listConversations,
   listMessages,
   sendMessage,
+  markRead,
+  getUnread,
   startConversation,
   MESSAGE_MAX,
   NOTES_MAX,
@@ -60,12 +62,18 @@ import {
 import {
   LOGIN_PROMPT,
   TABS,
+  boughtGarden,
   collectionText,
   confirmChipText,
   countAfterBuy,
   detailRecSub,
   figureRows,
   gardenChipText,
+  gardenCounts,
+  canMakeFigure,
+  makeable,
+  makeableText,
+  recShortText,
   levelChipText,
   levelPercent,
   recSubText,
@@ -74,7 +82,22 @@ import {
   type TabKey,
 } from "./home";
 import { useGarden, type GardenState } from "./useGarden";
-import { chatBuyable, initialOf, myCounts, mySections, previewText, relativeTime } from "./pages";
+import {
+  chatItemBadges,
+  initialOf,
+  markConvRead,
+  myCounts,
+  mySections,
+  nextCursor,
+  previewText,
+  relativeTime,
+  sellerName,
+  unreadBadge,
+  unreadLabel,
+  unreadOf,
+  unreadTotal,
+} from "./pages";
+import { normalizePriceInput, parsePrice, priceError } from "./sell";
 import { detailRecs, loadSeenTitles, nearQuery, recommend, rememberSeen, type Rec, type RecInput } from "./recommend";
 import "./App.css";
 
@@ -97,7 +120,7 @@ type View =
   | { kind: "list" }
   | { kind: "search" }
   | { kind: "sell" }
-  | { kind: "detail"; id: string; from?: From } // from：戻るボタンの行き先（無ければホーム）
+  | { kind: "detail"; id: string; from?: From; make?: boolean } // from：戻るボタンの行き先（無ければホーム）。make：開いたら模型づくりの所まで動かす
   | { kind: "confirm"; item: Item; from?: From } // from：やめて詳細へ戻るときに引き継ぐ
   | { kind: "bought"; item: Item }
   | { kind: "mypage" }
@@ -163,6 +186,29 @@ export default function App() {
     if (userChanged || viewKind === "list" || viewKind === "garden" || viewKind === "bought") garden.reload();
     if (viewKind === "list" || viewKind === "bought" || allItems === null) loadAll();
   }, [authStatus, myId, viewKind]);
+
+  // メッセージの未読の合計（ヘッダーの 💬 と下部タブのバッジ）。メッセージ画面の外では UNREAD_POLL_MS ごとに読み直し、
+  // メッセージ画面の中では一覧の読み直し（と会話を開いて既読にしたとき）の数を Messages から受け取る（二重に読まない）。
+  // 読めないとき（既読の表が無いなど）は黙って前の数のまま（バッジが出ないだけで、メッセージは使える）
+  // 数は「誰の数か」と組で持つ（ログアウト・別の人でログインしたときに、前の人の数を出さない）
+  const [unreadFor, setUnreadFor] = useState({ user: "", n: 0 });
+  const unread = myId && unreadFor.user === myId ? unreadFor.n : 0;
+  const setUnread = (n: number) => setUnreadFor({ user: myId, n });
+  const inMessages = viewKind === "inbox" || viewKind === "chat";
+  useEffect(() => {
+    if (!myId || inMessages) return;
+    let alive = true;
+    const load = () =>
+      getUnread()
+        .then((n) => alive && setUnreadFor({ user: myId, n }))
+        .catch(() => undefined);
+    load();
+    const t = window.setInterval(load, UNREAD_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [myId, inMessages]);
 
   useEffect(() => {
     if (!hint) return;
@@ -288,8 +334,13 @@ export default function App() {
             </button>
           )}
           {state.status === "ready" && (
-            <button className="ghost small header-only" onClick={() => go({ kind: "inbox" })}>
+            <button
+              className="ghost small header-only msg-btn"
+              onClick={() => go({ kind: "inbox" })}
+              aria-label={unreadBadge(unread) ? `メッセージ（${unreadLabel(unread)}）` : undefined}
+            >
               💬 メッセージ
+              <UnreadBadge n={unread} />
             </button>
           )}
           {state.status === "ready" && view.kind !== "sell" && (
@@ -378,6 +429,7 @@ export default function App() {
               <ItemDetail
                 key={view.id} // 似ている出品から別の商品へ移ったら、前の商品の表示を残さない
                 id={view.id}
+                make={view.make ?? false}
                 backLabel={BACK[view.from ?? "home"]}
                 onBack={() => {
                   const f = view.from ?? "home";
@@ -409,6 +461,7 @@ export default function App() {
                 onMypage={() => go({ kind: "mypage" })}
                 onList={() => goList()}
                 onChat={(conv) => go({ kind: "chat", conv })}
+                onMake={() => go({ kind: "detail", id: view.item.id, from: "mypage", make: true })}
                 recs={boughtRecs}
                 rail={recRail}
                 onOpen={(id) => go({ kind: "detail", id, from: "home" })}
@@ -431,6 +484,7 @@ export default function App() {
                 time={time}
                 onTime={setTime}
                 onOpen={(id) => go({ kind: "detail", id, from: "garden" })}
+                onMake={(id) => go({ kind: "detail", id, from: "garden", make: true })}
                 backLabel={BACK[view.from ?? "home"]}
                 onBack={() => (view.from === "mypage" ? go({ kind: "mypage" }) : goList())}
               />
@@ -443,6 +497,7 @@ export default function App() {
                 onBack={() => go({ kind: "inbox" })}
                 onItem={(id) => go({ kind: "detail", id })}
                 onBuy={(item) => go({ kind: "confirm", item })}
+                onUnread={setUnread}
               />
             )}
             {view.kind === "admin" && <AdminPage onOpen={(id) => go({ kind: "detail", id, from: "admin" })} />}
@@ -452,7 +507,7 @@ export default function App() {
 
       <footer className="api">API: {API_URL}</footer>
       {/* ログインの入口・初回登録（ヘッダーも無い画面）と購入確認（確定ボタンにタブが重ならないように）では下部タブを出さない */}
-      {!welcome && viewKind !== "confirm" && <TabBar current={currentTab} onTab={onTab} />}
+      {!welcome && viewKind !== "confirm" && <TabBar current={currentTab} onTab={onTab} unread={state.status === "ready" ? unread : 0} />}
     </div>
   );
 }
@@ -496,7 +551,7 @@ function TabIcon({ tab }: { tab: TabKey }) {
 }
 
 // ---- 下部タブ（スマホだけ表示）：ホーム／さがす／出品（中央・赤）／メッセージ／マイページ ----
-function TabBar({ current, onTab }: { current: TabKey | null; onTab: (key: TabKey) => void }) {
+function TabBar({ current, onTab, unread }: { current: TabKey | null; onTab: (key: TabKey) => void; unread: number }) {
   return (
     <nav className="tabbar" aria-label="メインメニュー">
       {TABS.map((t) => (
@@ -505,15 +560,28 @@ function TabBar({ current, onTab }: { current: TabKey | null; onTab: (key: TabKe
           type="button"
           className={`tab ${t.key === "sell" ? "tab-sell" : ""} ${current === t.key ? "on" : ""}`}
           aria-current={current === t.key ? "page" : undefined}
+          aria-label={t.key === "messages" && unreadBadge(unread) ? `${t.label}（${unreadLabel(unread)}）` : undefined}
           onClick={() => onTab(t.key)}
         >
           <span className="tab-icon" aria-hidden>
             <TabIcon tab={t.key} />
+            {t.key === "messages" && <UnreadBadge n={unread} />}
           </span>
           <span className="tab-label">{t.label}</span>
         </button>
       ))}
     </nav>
+  );
+}
+
+// ---- 未読の数の丸いバッジ（0 なら出さない。100 以上は「99+」）。読み上げは親のボタンの aria-label で ----
+function UnreadBadge({ n }: { n: number }) {
+  const text = unreadBadge(n);
+  if (!text) return null;
+  return (
+    <span className="unread-badge" aria-hidden>
+      {text}
+    </span>
   );
 }
 
@@ -554,6 +622,8 @@ function Home({
   const known = !loading && !garden.error;
   const sel = entries.find((e) => e.id === selected);
   const [skyTop, skyBottom] = SKY_COLORS[time];
+  // 模型がまだで、写真からつくれる物（つくると箱庭に並ぶ。箱庭の画面の「模型がまだの商品」へ案内する）
+  const toMake = known && !signedOut ? makeableText(makeable(garden.data?.missing ?? []).length) : "";
 
   return (
     <div className="home">
@@ -612,6 +682,11 @@ function Home({
             </button>
           </div>
         )}
+        {toMake && (
+          <button className="make-chip" onClick={onGarden}>
+            ✨ {toMake}
+          </button>
+        )}
         {garden.layoutMsg && <p className={garden.layoutMsg.endsWith("しました") ? "ok" : "err"}>{garden.layoutMsg}</p>}
       </section>
 
@@ -624,6 +699,7 @@ function Home({
         title="あなたへのおすすめ"
         sub={recSubText(recs.map((r) => r.reason.kind))}
         recs={recs}
+        limit={4}
         {...rail}
         onOpen={onOpen}
         onLike={onLike}
@@ -766,6 +842,7 @@ function RecRail({
   small = false,
   hideEmpty = false,
   showReason = true,
+  limit = 0,
 }: {
   title: string;
   sub?: string;
@@ -777,8 +854,10 @@ function RecRail({
   small?: boolean;
   hideEmpty?: boolean; // 0件なら列ごと出さない（詳細の「似ている出品」）
   showReason?: boolean; // 理由チップ。詳細の「似ている出品」は見出しが理由なので出さない
+  limit?: number; // 出したい件数。これに満たないときは理由を一言出す（0 なら出さない）
 } & RailState) {
   if (hideEmpty && !loading && !error && recs.length === 0) return null;
+  const short = limit > 0 ? recShortText(recs.length, limit) : "";
   return (
     <section className={`recs ${small ? "recs-small" : ""}`} aria-label={title}>
       <div className="panel-head">
@@ -791,8 +870,9 @@ function RecRail({
       ) : loading ? (
         <p className="muted">読み込み中…</p>
       ) : recs.length === 0 ? (
-        <p className="muted">いまおすすめできる出品はありません。</p>
+        <p className="muted">{short || "いまおすすめできる出品はありません。"}</p>
       ) : (
+        <>
         <ul className="rec-grid">
           {recs.map((r) => (
             <li key={r.item.id} className="card-wrap">
@@ -811,6 +891,8 @@ function RecRail({
             </li>
           ))}
         </ul>
+        {short && <p className="muted rec-short">{short}</p>}
+        </>
       )}
     </section>
   );
@@ -1042,6 +1124,8 @@ function ItemList({
               <div className="card-body">
                 <span className="title">{it.title}</span>
                 <span className="price">{yen(it.price)}</span>
+                {/* 出品者名は詳細と同じ（API の今の表示名。見本データは「（見本データ）」） */}
+                <small className="muted card-seller">出品者 {sellerName(it)}</small>
               </div>
               {it.status === "sold" && <span className="sold">SOLD</span>}
               {it.moderation_status === "review" && <span className="review-mark">確認中</span>}
@@ -1252,6 +1336,7 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
     }
   };
   const r = ITEM_RULES;
+  const sellPrice = priceError(price, r.priceMin, r.priceMax) ? null : parsePrice(price);
 
   // 説明欄に書いたメモ（箇条書きでよい）を、Gemini が説明文に整える
   const onDraft = async () => {
@@ -1296,10 +1381,11 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    const p = Number(price);
-    // 送る前にも確かめる（最終的な判定はバックエンド）
-    if (!Number.isInteger(p) || p < r.priceMin || p > r.priceMax) {
-      setError(`価格は ${yen(r.priceMin)}〜${yen(r.priceMax)} の整数で入力してください`);
+    // 打った文字をそのまま整数にする（丸めない）。送る前にも確かめる（最終的な判定はバックエンド）
+    const bad = priceError(price, r.priceMin, r.priceMax);
+    const p = parsePrice(price);
+    if (bad || p === null) {
+      setError(bad);
       return;
     }
     setBusy(true);
@@ -1409,14 +1495,14 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
             価格（円）
             <span className="yen-input">
               <span aria-hidden>¥</span>
+              {/* type="number" にしない：ホイールや ↑↓ キーで値が勝手に増減するため（500 → 497 の事例）。
+                  全角数字・カンマはそろえてから持つ（sell.ts） */}
               <input
-                type="number"
+                type="text"
                 inputMode="numeric"
+                autoComplete="off"
                 value={price}
-                onChange={(e) => setPrice(e.target.value)}
-                min={r.priceMin}
-                max={r.priceMax}
-                step={1}
+                onChange={(e) => setPrice(normalizePriceInput(e.target.value))}
                 placeholder={`${r.priceMin}〜${r.priceMax.toLocaleString()}`}
                 required
               />
@@ -1457,7 +1543,8 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
         <div className="sell-submit">
           {error && <p className="err">{error}</p>}
           <button className="primary sell-go" disabled={busy || photoBusy || making}>
-            {busy ? "AI が出品内容を確認中…" : "➤ 出品する"}
+            {/* 送る金額をボタンに出す（入れた金額と違えば、押す前に気づけるように） */}
+            {busy ? "AI が出品内容を確認中…" : sellPrice !== null ? `➤ ${yen(sellPrice)}で出品する` : "➤ 出品する"}
           </button>
           <button type="button" className="link" onClick={onCancel}>
             やめる
@@ -1472,6 +1559,7 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
 // 見本に無い物（模型づくり・確認中の印・質問）は、写真カードの下と右カードの下に置く。スマホは縦1列で、購入ボタンは画面下に固定。
 function ItemDetail({
   id,
+  make,
   backLabel,
   onBack,
   onBuy,
@@ -1484,6 +1572,7 @@ function ItemDetail({
   onMessage,
 }: {
   id: string;
+  make: boolean; // 購入完了・箱庭の「模型をつくる」から来た：読み込んだら「箱庭の模型」の所まで動かす
   backLabel: string;
   onBack: () => void;
   onBuy: (item: Item) => void;
@@ -1517,6 +1606,13 @@ function ItemDetail({
     };
   }, [id, authStatus]);
 
+  // 「模型をつくる」から来たときは、読み込めたら模型づくりの所を見せる
+  const figPanel = useRef<HTMLDivElement>(null);
+  const loadedItem = item !== null;
+  useEffect(() => {
+    if (make && loadedItem) figPanel.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, [make, loadedItem]);
+
   const note = item ? moderationNote(item.moderation_status, item.moderation_reason) : null;
   const hidden = item?.moderation_status === "hidden"; // 非公開：買う・メッセージ・質問はできない
   const mine = state.status === "ready" && item?.seller?.id === state.me.id;
@@ -1541,7 +1637,7 @@ function ItemDetail({
               <Thumb item={item} className="thumb large" photoFirst />
             </div>
             {!hidden && (item.photo_image_id || item.figure) && (
-              <div className="panel detail-extra">
+              <div className={`panel detail-extra ${make ? "focus" : ""}`} ref={figPanel}>
                 <h2 className="panel-title">箱庭の模型</h2>
                 <FigureMaker
                   item={item}
@@ -1567,7 +1663,7 @@ function ItemDetail({
                 <span className="avatar" aria-hidden>
                   {item.seller ? initialOf(item.seller.display_name) : "見"}
                 </span>
-                出品者 {item.seller ? item.seller.display_name : "（見本データ）"}
+                出品者 {sellerName(item)}
               </p>
               {(chip || evolve) && (
                 <p className="buy-chips">
@@ -1865,7 +1961,7 @@ function BuyConfirm({ item, onDone, onCancel }: { item: Item; onDone: (item: Ite
                 <span className="avatar" aria-hidden>
                   {item.seller ? initialOf(item.seller.display_name) : "見"}
                 </span>
-                出品者 {item.seller ? item.seller.display_name : "（見本データ）"}
+                出品者 {sellerName(item)}
               </p>
               <p className="price big">{yen(item.price)}</p>
             </div>
@@ -1907,6 +2003,7 @@ function Bought({
   onMypage,
   onList,
   onChat,
+  onMake,
   recs,
   rail,
   onOpen,
@@ -1919,6 +2016,7 @@ function Bought({
   onMypage: () => void;
   onList: () => void;
   onChat: (conv: Conversation) => void;
+  onMake: () => void; // 商品ページの「箱庭の模型」へ（模型がまだで写真がある物）
   recs: Rec[];
   rail: RailState;
   onOpen: (id: string) => void;
@@ -1928,6 +2026,7 @@ function Bought({
   const after = garden ? countAfterBuy(garden.entries, item) : 0;
   const level = gardenLevel(after);
   const joins = !!item.figure; // 模型のある物だけが箱庭に並ぶ
+  const card = boughtGarden(item);
   return (
     <section className="buy-flow">
       <div className="panel done-card">
@@ -1947,25 +2046,25 @@ function Bought({
       </div>
       <div className="done-grid">
         <div className="panel done-garden">
-          <h2 className="panel-title">{joins ? "✨ 箱庭に仲間入り！" : "買った商品"}</h2>
+          <h2 className="panel-title">{card.title}</h2>
           <div className="done-photo">
             <Thumb item={item} className="thumb" photoFirst />
             {joins && <span className="garden-new">NEW</span>}
           </div>
           <LevelCard count={after} known={garden !== null} failed={gardenError !== ""} />
-          <small className="muted">
-            {joins
-              ? "模型がホームの箱庭に並びます。"
-              : item.photo_image_id
-                ? "商品ページで写真から模型をつくると、箱庭に並びます。"
-                : "この商品は写真が無いので、模型はつくれません。"}
-          </small>
+          {card.make && (
+            <button className="primary make-btn" onClick={onMake}>
+              ✨ 写真から模型をつくる
+            </button>
+          )}
+          <small className="muted">{card.note}</small>
         </div>
         <div className="panel done-next">
           <RecRail
             title="💡 つぎはこれ"
             sub={garden && level.next ? `あなたへのおすすめ・実在の出品（あと${level.toNext}個で ${level.next.name}）` : "あなたへのおすすめ・実在の出品"}
             recs={recs}
+            limit={3}
             {...rail}
             onOpen={onOpen}
             onLike={onLike}
@@ -2154,6 +2253,7 @@ function Garden({
   time,
   onTime,
   onOpen,
+  onMake,
   backLabel,
   onBack,
 }: {
@@ -2161,6 +2261,7 @@ function Garden({
   time: TimeOfDay;
   onTime: (t: TimeOfDay) => void;
   onOpen: (id: string) => void;
+  onMake: (id: string) => void; // 商品ページの「箱庭の模型」へ
   backLabel: string;
   onBack: () => void;
 }) {
@@ -2169,7 +2270,11 @@ function Garden({
   const [shotMsg, setShotMsg] = useState("");
   const handle = useRef<GardenHandle | null>(null);
 
-  const count = (tag: GardenEntry["tag"]) => data?.entries.filter((e) => e.tag === tag).length ?? 0;
+  // カウンターは模型の有無にかかわらず数える（マイページの件数と同じ）。箱庭に並ぶのは、そのうち模型のある物
+  const counts = data ? gardenCounts(data) : null;
+  const toMake = makeable(data?.missing ?? []);
+  const missingRef = useRef<HTMLElement>(null);
+  const showMissing = () => missingRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
   const level = gardenLevel(data?.entries.length ?? 0);
   const sel = data?.entries.find((e) => e.id === selected);
   const [skyTop, skyBottom] = SKY_COLORS[time];
@@ -2241,9 +2346,16 @@ function Garden({
                   {shotMsg && <p className="ok">{shotMsg}</p>}
                 </>
               ) : (
-                <p className="garden-empty">
-                  まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
-                </p>
+                <div className="garden-empty">
+                  <p>
+                    まだ模型がありません。写真つきの商品を開いて「✨ 写真から3D模型をつくる」→「この模型を保存して箱庭に飾る」と、ここに並びます。
+                  </p>
+                  {toMake.length > 0 && (
+                    <button className="primary small" onClick={showMissing}>
+                      ✨ 模型をつくれる商品を見る（{toMake.length}件）
+                    </button>
+                  )}
+                </div>
               )}
             </section>
 
@@ -2259,26 +2371,45 @@ function Garden({
                   <span className="muted">時間帯</span>
                   <TimeToggle time={time} onChange={onTime} />
                 </div>
-                <small className="muted">
-                  売った物 {count("sold")}・買った物 {count("bought")}・出品中 {count("selling")}
-                </small>
+                {counts && (
+                  <small className="muted">
+                    売った物 {counts.sold}・買った物 {counts.bought}・出品中 {counts.selling}（うち箱庭の模型 {counts.models}個）
+                  </small>
+                )}
+                {toMake.length > 0 && (
+                  <button className="make-chip" onClick={showMissing}>
+                    ✨ {makeableText(toMake.length)}
+                  </button>
+                )}
               </LevelCard>
               <FigureList data={data} signedOut={false} loading={false} error="" onOpen={onOpen} />
             </div>
           </div>
 
           {data.missing.length > 0 && (
-            <section className="panel garden-missing">
-              <h2 className="panel-title">模型がまだの商品</h2>
+            <section className="panel garden-missing" ref={missingRef} aria-labelledby="garden-missing-title">
+              <h2 id="garden-missing-title" className="panel-title">
+                模型がまだの商品
+              </h2>
+              <p className="muted">
+                売った物・買った物でも、模型が無いと箱庭には並びません。写真から模型をつくって保存すると並びます（模型は商品に1つで、出品者と購入者の両方の箱庭に並びます）。
+              </p>
               <ul className="rows">
                 {data.missing.map((it) => (
                   <li key={it.id}>
-                    <button className="row" onClick={() => onOpen(it.id)}>
+                    <button className="row" onClick={() => (canMakeFigure(it) ? onMake(it.id) : onOpen(it.id))}>
                       <Thumb item={it} className="thumb small" />
                       <span className="row-main">
                         <span className="title">{it.title}</span>
-                        <small className="muted">{it.photo_image_id ? "開いて模型をつくる" : "写真がないので模型はつくれません"}</small>
+                        <small className="muted">
+                          {canMakeFigure(it)
+                            ? "写真があるので模型をつくれます"
+                            : it.moderation_status === "hidden"
+                              ? "非公開のため模型はつくれません"
+                              : "写真がないので模型はつくれません"}
+                        </small>
                       </span>
+                      {canMakeFigure(it) && <span className="make-go">✨ 模型をつくる</span>}
                     </button>
                   </li>
                 ))}
@@ -2317,23 +2448,28 @@ function StartChatButton({ itemId, onChat, label }: { itemId: string; onChat: (c
 
 // 会話の一覧を読み直す間隔（会話の中の新着は POLL_MS ごと）
 const LIST_POLL_MS = 15000;
+// メッセージ画面の外で、ナビの未読の数を読み直す間隔
+const UNREAD_POLL_MS = 30000;
 
 // ---- メッセージ（A-1）：左に会話の一覧、右に開いた会話 ----
 // PC（761px 以上）は2カラムで同時に出し、スマホは今までどおり 一覧 → 会話 の2段階（CSS で片方だけ出す）。
 // 一覧に出すのは API にある物だけ：相手の名前・商品（写真）・最新のメッセージ・その時刻（「5分前」の形）。
-// 未読の数と相手のアイコン画像は API に無いので出さない（アイコンは商品の写真か、相手の頭文字）。
+// 未読の数（unread_count）は各行の右にバッジで出す。いま開いている会話は 0 として扱い、開いたら既読にする（PUT …/read）。
+// 相手のアイコン画像は API に無いので出さない（アイコンは商品の写真か、相手の頭文字）。
 function Messages({
   conv,
   onOpen,
   onBack,
   onItem,
   onBuy,
+  onUnread,
 }: {
   conv: Conversation | null;
   onOpen: (conv: Conversation) => void;
   onBack: () => void;
   onItem: (id: string) => void;
   onBuy: (item: Item) => void;
+  onUnread: (n: number) => void; // ナビのバッジの数（未読の合計）
 }) {
   const [convs, setConvs] = useState<Conversation[] | null>(null);
   const [error, setError] = useState("");
@@ -2346,6 +2482,10 @@ function Messages({
   // 読み直しの失敗は、もう一覧が出ていれば黙って次を待つ（一度読めた一覧を消さない）
   const convId = conv?.id ?? "";
   const loaded = useRef(false);
+  const unreadCb = useRef(onUnread);
+  useEffect(() => {
+    unreadCb.current = onUnread;
+  });
   useEffect(() => {
     let alive = true;
     const load = () =>
@@ -2355,6 +2495,7 @@ function Messages({
           loaded.current = true;
           setConvs(cs);
           setError("");
+          unreadCb.current(unreadTotal(cs, convId)); // 開いている会話は数えない（画面に出ているので）
         })
         .catch((e) => {
           if (alive && !loaded.current) setError(e instanceof Error ? e.message : String(e));
@@ -2378,6 +2519,12 @@ function Messages({
       return cs.map((c) => (c.id === c0.id && (!c.last_message || c.last_message.id < m.id) ? { ...c, last_message: m } : c));
     });
 
+  // 開いた会話を既読にできたら、一覧のその行を 0 にし、ナビの数をサーバーの合計にそろえる
+  const onRead = (id: string, total: number) => {
+    setConvs((cs) => (cs ? markConvRead(cs, id) : cs));
+    onUnread(total);
+  };
+
   return (
     <section className={`dm ${conv ? "dm-open" : ""}`}>
       <div className="panel dm-list">
@@ -2386,25 +2533,46 @@ function Messages({
         {list === null && !error && <p className="muted">読み込み中…</p>}
         {list?.length === 0 && <p className="muted">まだやりとりはありません。商品ページの「メッセージを送る」から始められます。</p>}
         <ul className="dm-convs">
-          {list?.map((c) => (
-            <li key={c.id}>
-              <button className={`dm-conv ${conv?.id === c.id ? "on" : ""}`} onClick={() => onOpen(c)} aria-current={conv?.id === c.id ? "true" : undefined}>
-                <ConvIcon item={c.item} name={c.partner.display_name} />
-                <span className="dm-conv-main">
-                  <b className="dm-name">{c.partner.display_name}さん</b>
-                  <span className="muted preview">
-                    {c.item.title}・{previewText(c.last_message, myId)}
+          {list?.map((c) => {
+            const n = unreadOf(c, convId);
+            return (
+              <li key={c.id}>
+                <button
+                  className={`dm-conv ${conv?.id === c.id ? "on" : ""} ${n > 0 ? "unread" : ""}`}
+                  onClick={() => onOpen(c)}
+                  aria-current={conv?.id === c.id ? "true" : undefined}
+                >
+                  <ConvIcon item={c.item} name={c.partner.display_name} />
+                  <span className="dm-conv-main">
+                    <b className="dm-name">{c.partner.display_name}さん</b>
+                    <span className="muted preview">
+                      {c.item.title}・{previewText(c.last_message, myId)}
+                    </span>
                   </span>
-                </span>
-                {c.last_message && <span className="muted when">{relativeTime(c.last_message.created_at, now)}</span>}
-              </button>
-            </li>
-          ))}
+                  <span className="dm-conv-side">
+                    {c.last_message && <span className="muted when">{relativeTime(c.last_message.created_at, now)}</span>}
+                    <UnreadBadge n={n} />
+                    {n > 0 && <span className="visually-hidden">{unreadLabel(n)}</span>}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       </div>
       <div className="dm-pane">
         {conv ? (
-          <Chat key={conv.id} conv={conv} myId={myId} now={now} onBack={onBack} onItem={onItem} onBuy={onBuy} onLatest={(m) => onLatest(conv, m)} />
+          <Chat
+            key={conv.id}
+            conv={conv}
+            myId={myId}
+            now={now}
+            onBack={onBack}
+            onItem={onItem}
+            onBuy={onBuy}
+            onLatest={(m) => onLatest(conv, m)}
+            onRead={(total) => onRead(conv.id, total)}
+          />
         ) : (
           <div className="panel dm-empty">
             <p className="muted">左の一覧から、やりとりを選んでください。</p>
@@ -2448,6 +2616,7 @@ function Chat({
   onItem,
   onBuy,
   onLatest,
+  onRead,
 }: {
   conv: Conversation;
   myId: string;
@@ -2456,6 +2625,7 @@ function Chat({
   onItem: (id: string) => void;
   onBuy: (item: Item) => void;
   onLatest: (m: Message) => void;
+  onRead: (total: number) => void; // 既読にできた（total は既読にした後の未読の合計）
 }) {
   const [msgs, setMsgs] = useState<Message[] | null>(null);
   const [body, setBody] = useState("");
@@ -2466,8 +2636,10 @@ function Chat({
   const bottom = useRef<HTMLDivElement>(null);
   // 一覧へ知らせる関数は描画のたびに変わるので、最新のものを ref に入れておく（ポーリングを張り直さないように）
   const latestCb = useRef(onLatest);
+  const readCb = useRef(onRead);
   useEffect(() => {
     latestCb.current = onLatest;
+    readCb.current = onRead;
   });
 
   // 届いたメッセージを足す（同じ ID は1回だけ。送信とポーリングが重なっても二重にならない）
@@ -2475,9 +2647,7 @@ function Chat({
     if (more.length === 0) return;
     setMsgs((prev) => {
       const seen = new Set((prev ?? []).map((m) => m.id));
-      const next = [...(prev ?? []), ...more.filter((m) => !seen.has(m.id))].sort((a, b) => (a.id < b.id ? -1 : 1));
-      lastId.current = next.length ? next[next.length - 1].id : "";
-      return next;
+      return [...(prev ?? []), ...more.filter((m) => !seen.has(m.id))].sort((a, b) => (a.id < b.id ? -1 : 1));
     });
     latestCb.current(more.reduce((a, b) => (a.id < b.id ? b : a)));
   };
@@ -2485,13 +2655,27 @@ function Chat({
   useEffect(() => {
     let stopped = false;
     let timer: number | undefined;
+    // 既読：会話を開いて最初に読んだとき・新しいメッセージを画面に出したときに、画面に出した最後のメッセージまでを
+    // 既読にする（PUT …/read）。同じ位置は2回送らない。失敗してもメッセージは使える（バッジが減らないだけ）
+    let readUpTo = "";
+    const markShown = (lastShown: string) => {
+      if (lastShown <= readUpTo) return;
+      readUpTo = lastShown;
+      markRead(conv.id, lastShown)
+        .then((total) => !stopped && readCb.current(total))
+        .catch(() => undefined);
+    };
     const tick = async () => {
       try {
         const more = await listMessages(conv.id, lastId.current);
         if (stopped) return;
+        // 取りに行く位置は、サーバーから受け取った分でだけ進める。自分の送信（onSend）では進めない：
+        // 進めると、送信の直前に相手が送った（ID が小さい）メッセージを取りに行かなくなるため
+        lastId.current = nextCursor(lastId.current, more);
         setMsgs((prev) => prev ?? []);
         append(more);
         setError("");
+        if (more.length > 0) markShown(more.reduce((a, b) => (a.id < b.id ? b : a)).id);
       } catch (e) {
         if (!stopped) setError(e instanceof Error ? e.message : String(e));
       }
@@ -2529,7 +2713,7 @@ function Chat({
   };
 
   const item = conv.item;
-  const own = !!myId && item.seller?.id === myId;
+  const badges = chatItemBadges(item, myId);
 
   return (
     <div className="panel chat">
@@ -2542,7 +2726,8 @@ function Chat({
         </span>
         {conv.partner.display_name}さんとのやりとり
       </p>
-      {/* 上の商品カード：写真・商品名・価格・「購入する」（売り切れ・自分の商品なら出さない） */}
+      {/* 上の商品カード：写真・商品名・価格・「購入する」（売り切れ・自分の商品なら出さない）。
+          「売り切れ」と「あなたの出品」は両方当たれば並べて出す */}
       <div className="dm-item">
         <button className="dm-item-photo" onClick={() => onItem(item.id)} aria-label={`${item.title}の商品ページ`}>
           <Thumb item={item} photoFirst />
@@ -2553,15 +2738,17 @@ function Chat({
           </button>
           <span className="price">{yen(item.price)}</span>
         </div>
-        {chatBuyable(item, myId) ? (
-          <button className="primary small" onClick={() => onBuy(item)}>
-            購入する
-          </button>
-        ) : item.status === "sold" ? (
-          <span className="badge sold-badge">売り切れ</span>
-        ) : own ? (
-          <span className="badge">あなたの出品</span>
-        ) : null}
+        {(badges.buy || badges.sold || badges.own) && (
+          <div className="dm-item-badges">
+            {badges.buy && (
+              <button className="primary small" onClick={() => onBuy(item)}>
+                購入する
+              </button>
+            )}
+            {badges.sold && <span className="badge sold-badge">売り切れ</span>}
+            {badges.own && <span className="badge">あなたの出品</span>}
+          </div>
+        )}
       </div>
       <div className="msgs" ref={box}>
         {msgs === null && <p className="muted">読み込み中…</p>}
@@ -2677,7 +2864,7 @@ function AdminPage({ onOpen }: { onOpen: (id: string) => void }) {
                 {it.title}
               </button>
               <span className="muted">
-                {yen(it.price)}・出品者: {it.seller ? it.seller.display_name : "（見本データ）"}
+                {yen(it.price)}・出品者: {sellerName(it)}
               </span>
               <p className="admin-reason">{it.moderation_reason || "（理由の記録なし）"}</p>
               <input

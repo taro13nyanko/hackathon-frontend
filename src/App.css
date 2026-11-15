@@ -764,3 +764,43 @@ span.dm-icon { font-size: 1.2rem; }
   /* ログインの入口には下部タブが無いので、タブの分の下の余白はとらない */
   .app.welcome-bg { padding-bottom: env(safe-area-inset-bottom); }
 }
+
+/* ---- 2026-11 実機テストの修正 ---- */
+/* 理由チップ：履歴のある人で、どの理由にも当たらなかった出品（「まずはここから」は履歴の無い人だけ） */
+.reason-pick { background: #eef0f3; color: #4a5260; }
+/* おすすめが件数に満たないときの一言 */
+.rec-short { margin: 8px 0 0; font-size: 0.85rem; }
+/* 一覧カードの出品者名（詳細と同じ表示名） */
+.card-seller { font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 未読の数のバッジ（ヘッダーの 💬・下部タブ・会話一覧の各行） */
+.unread-badge {
+  display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 6px; box-sizing: border-box;
+  border-radius: 999px; background: var(--accent); color: #fff; font-size: 0.72rem; font-weight: 800; line-height: 1;
+}
+.msg-btn { display: inline-flex; align-items: center; gap: 6px; }
+.tab-icon { position: relative; }
+.tab-icon .unread-badge { position: absolute; top: -6px; left: calc(50% + 4px); border: 2px solid #fff; min-width: 22px; height: 22px; }
+.dm-conv-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; align-self: start; }
+.dm-conv.unread .dm-name { font-weight: 900; }
+.dm-conv.unread .preview { color: var(--ink); font-weight: 700; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* メッセージの商品カード：「売り切れ」と「あなたの出品」を並べる */
+.dm-item-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+
+/* 模型づくりへの導線（ホーム・箱庭・購入完了） */
+.make-chip {
+  display: inline-block; margin-top: 8px; padding: 6px 14px; border-radius: var(--pill);
+  background: #fff4d6; color: #8a5a00; font-size: 0.85rem; font-weight: 800; text-align: left;
+}
+.make-chip:hover { background: #ffe9b0; }
+.make-btn { align-self: center; margin: 8px 0 4px; }
+.make-go { justify-self: end; padding: 4px 10px; border-radius: var(--pill); background: var(--accent); color: #fff; font-size: 0.8rem; font-weight: 800; white-space: nowrap; }
+.garden-missing > .muted { margin: 4px 0 0; font-size: 0.9rem; }
+.garden-empty p { margin: 0 0 12px; }
+/* 「模型をつくる」から来た詳細ページ：模型のパネルを目立たせる */
+.detail-extra.focus { box-shadow: 0 0 0 3px #f5b5af; }
+@media (max-width: 760px) {
+  .garden-missing .make-go { grid-column: 2; justify-self: start; }
+}

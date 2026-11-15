@@ -7,6 +7,7 @@ import {
   REC_SUB,
   REC_SUB_STARTER,
   TABS,
+  boughtGarden,
   buildGarden,
   collectionText,
   confirmChipText,
@@ -14,12 +15,17 @@ import {
   detailRecSub,
   figureRows,
   gardenChipText,
+  gardenCounts,
   levelChipText,
+  makeable,
+  makeableText,
+  recShortText,
   levelPercent,
   recSubText,
   tabOf,
 } from "../src/home.ts";
 import { gardenLevel } from "../src/garden.ts";
+import { myCounts, mySections } from "../src/pages.ts";
 import type { Figure, Item, Purchase } from "../src/api.ts";
 import type { GardenEntry } from "../src/garden.ts";
 
@@ -181,4 +187,65 @@ test("詳細のおすすめ帯の補足：使った理由だけを書く", () =>
   assert.equal(detailRecSub(["similar", "starter"]), "この商品に近い物と、新着・模型つき・手ごろな実在の出品");
   assert.equal(detailRecSub(["starter", "starter"]), REC_SUB_STARTER);
   assert.equal(detailRecSub(["budget"]), REC_SUB);
+});
+
+// ---- 2026-11 実機テストの修正：模型が無い物も数える・模型づくりへの導線・おすすめが足りないときの一言 ----
+
+test("箱庭のカウンター：模型の有無にかかわらず数え、マイページの件数と同じになる。models は模型のある数", () => {
+  const mine = [
+    item("a", { figure: fig, status: "sold" }),
+    item("s", { status: "sold", photo_image_id: "img-s" }), // 模型なしで売れた（売った側）
+    item("b", { figure: fig }),
+    item("c"),
+  ];
+  const bought = [
+    purchase(item("d", { figure: fig, status: "sold", seller: { id: "x", display_name: "x" } }), "2026-11-02T00:00:00Z"),
+    purchase(item("e", { status: "sold", photo_image_id: "img-e", seller: { id: "x", display_name: "x" } }), "2026-11-03T00:00:00Z"), // 模型なしで買った
+  ];
+  const g = buildGarden(mine, bought, [], null);
+  const c = gardenCounts(g);
+  assert.deepEqual(c, { sold: 2, bought: 2, selling: 2, models: 3 });
+  assert.deepEqual({ sold: c.sold, bought: c.bought, selling: c.selling }, myCounts(mySections(mine, bought)), "マイページと同じ数");
+  assert.deepEqual(gardenCounts(buildGarden([], [], [], null)), { sold: 0, bought: 0, selling: 0, models: 0 });
+});
+
+test("模型をつくれる物：模型がまだで写真がある物だけ。チップの文は0件なら出さない", () => {
+  const g = buildGarden([item("p", { photo_image_id: "img" }), item("n"), item("f", { figure: fig, photo_image_id: "img2" })], [], [], null);
+  assert.deepEqual(makeable(g.missing).map((it) => it.id), ["p"]);
+  // 非公開の自分の出品は、写真があっても詳細で模型をつくれないので数えない
+  const hidden = buildGarden([item("h", { photo_image_id: "img3", moderation_status: "hidden" })], [], [], null);
+  assert.equal(hidden.missing.length, 1, "模型がまだの一覧には出る");
+  assert.deepEqual(makeable(hidden.missing), []);
+  assert.equal(makeableText(0), "");
+  assert.match(makeableText(2), /模型がまだ 2 件/);
+  assert.match(makeableText(2), /箱庭に並びます/);
+});
+
+test("購入完了の左のカード：模型あり＝仲間入り、写真のみ＝模型づくりのボタン、どちらも無し＝買った商品", () => {
+  const withFig = boughtGarden(item("a", { figure: fig, photo_image_id: "img" }));
+  assert.equal(withFig.title, "✨ 箱庭に仲間入り！");
+  assert.equal(withFig.make, false);
+  const photoOnly = boughtGarden(item("b", { photo_image_id: "img" }));
+  assert.match(photoOnly.title, /模型をつくると箱庭に並びます/);
+  assert.equal(photoOnly.make, true);
+  assert.match(photoOnly.note, /出品者の箱庭/, "模型は出品者の箱庭にも並ぶと書く");
+  const none = boughtGarden(item("c"));
+  assert.equal(none.title, "買った商品");
+  assert.equal(none.make, false);
+  assert.match(none.note, /写真が無い/);
+});
+
+test("おすすめが足りないときの一言：足りていれば出さず、0件と1〜2件で文を変える", () => {
+  assert.equal(recShortText(3, 3), "");
+  assert.equal(recShortText(4, 3), "");
+  assert.match(recShortText(1, 3), /この1件だけ/);
+  assert.match(recShortText(0, 3), /ありません/);
+  assert.match(recShortText(1, 3), /確認中/);
+  assert.match(recShortText(1, 3), /見本データ/);
+});
+
+test("理由「いま買える出品」（pick）は履歴ありの側に数える", () => {
+  assert.equal(recSubText(["pick", "pick"]), REC_SUB);
+  assert.equal(recSubText(["starter", "starter"]), REC_SUB_STARTER);
+  assert.equal(detailRecSub(["similar", "pick"]), "この商品に近い物と、箱庭・購入履歴から選んだ実在の出品");
 });

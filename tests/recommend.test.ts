@@ -58,10 +58,11 @@ const ids = (recs: Rec[]) => recs.map((r) => r.item.id);
 
 // ---- 除外 ----
 
-test("除外：売り切れ・自分の出品・非公開・見本データ・指定した商品は、どの場合も出ない", () => {
+test("除外：売り切れ・自分の出品・確認中・非公開・見本データ・指定した商品は、どの場合も出ない", () => {
   const cases: [string, Item, Partial<RecInput>][] = [
     ["売り切れ", mk("x", { status: "sold" }), {}],
     ["自分の出品", mk("x", { seller: { id: "me", display_name: "自分" } }), { viewerId: "me" }],
+    ["確認中（review）", mk("x", { moderation_status: "review" }), {}],
     ["非公開（hidden）", mk("x", { moderation_status: "hidden" }), {}],
     ["見本データ（出品者なし）", mk("x", { seller: null }), {}],
     ["excludeIds", mk("x"), { excludeIds: ["x"] }],
@@ -80,9 +81,15 @@ test("除外：売り切れ・自分の出品・非公開・見本データ・�
   }
 });
 
-test("確認中（review）の商品は買えるので出る。未ログイン（viewerId なし）でも出る", () => {
-  const got = recommend(input({ items: [mk("r", { moderation_status: "review" })] }), 4);
-  assert.deepEqual(ids(got), ["r"]);
+test("確認中（review）の商品は出さない（設計書 §2.1。ホーム・つぎはこれ・詳細のどれでも）", () => {
+  const items = [mk("r", { moderation_status: "review", created_at: FRESH }), mk("ok")];
+  const hists: Partial<RecInput>[] = [{}, { viewerId: "v" }, { purchases: [mk("p", { price: 2000, status: "sold" })] }];
+  for (const h of hists) {
+    assert.deepEqual(ids(recommend(input({ items, ...h }), 4)), ["ok"]);
+    // 購入完了の「つぎはこれ」（買った商品を除いて3件）
+    assert.deepEqual(ids(recommend(input({ items, excludeIds: ["bought"], ...h }), 3)), ["ok"]);
+    assert.ok(!ids(detailRecs(mk("base", { title: "商品r" }), input({ items, ...h }), 3)).includes("r"));
+  }
 });
 
 test("同じ商品が一覧に2回あっても1回だけ", () => {
@@ -107,8 +114,24 @@ test("多様性：同じカテゴリは limit の半分まで（カテゴリ不�
     assert.ok(nBooks <= cap, `limit ${limit} で本が ${nBooks} 件（上限 ${cap}）`);
     assert.ok(got.length <= limit);
   }
-  // 上限を超える分は数合わせで入れない（本6＋その他3、limit 8 → 本4＋その他3＝7件）
-  assert.equal(recommend(input({ items: [...books, ...others] }), 8).length, 7);
+  // 上限は目安：ほかの候補が尽きたら、上限で飛ばした本で埋める（本6＋その他3、limit 8 → 8件）
+  assert.equal(recommend(input({ items: [...books, ...others] }), 8).length, 8);
+});
+
+test("件数：候補があるのにカテゴリの上限で減らない（つぎはこれ3件：本3＋照明1 → 3件）", () => {
+  const items = [
+    mk("b1", { title: "文庫 1", created_at: FRESH }),
+    mk("b2", { title: "文庫 2", created_at: FRESH }),
+    mk("b3", { title: "文庫 3", created_at: FRESH }),
+    mk("l1", { title: "デスクライト" }),
+  ];
+  for (const h of [{}, { purchases: [mk("p", { price: 2000, status: "sold" })] }] as Partial<RecInput>[]) {
+    const got = recommend(input({ items, ...h }), 3);
+    assert.equal(got.length, 3);
+    assert.ok(ids(got).includes("l1"), "別のカテゴリの物は、上限で飛ばした物より先に入る");
+  }
+  // 候補そのものが少ないときだけ減る（候補1件 → 1件）
+  assert.equal(recommend(input({ items: [mk("only")] }), 3).length, 1);
 });
 
 // ---- 理由の種類ごと ----
@@ -134,9 +157,10 @@ test("理由：いちばん効いた理由が1つだけ付き、文言は仕様�
     ["前に見た商品に近い", { seenTitles: ["木製チェア ナチュラル"] }, mk("x", { title: "木製チェア 北欧風" }), "seen", "前に見た商品に近い"],
     ["予算内", { purchases: [mk("p", { title: "ギター", price: 2000, status: "sold" })] }, mk("x", { title: "傘", price: 800 }), "budget", "予算内"],
     ["新着", { seenTitles: ["まったく別のもの"] }, mk("x", { title: "傘", created_at: FRESH }), "new", "新着"],
-    ["当たる理由が無い", { seenTitles: ["まったく別のもの"] }, mk("x", { title: "傘" }), "starter", "まずはここから"],
+    // 履歴のある人で、どの理由にも当たらない商品は「いま買える出品」（「まずはここから」は履歴の無い人だけ）
+    ["当たる理由が無い", { seenTitles: ["まったく別のもの"] }, mk("x", { title: "傘" }), "pick", "いま買える出品"],
     // 見たその商品（タイトルが同じ）は「前に見た商品に近い」にしない
-    ["見た商品そのもの", { seenTitles: ["木製チェア 北欧風"] }, mk("x", { title: "木製チェア 北欧風" }), "starter", "まずはここから"],
+    ["見た商品そのもの", { seenTitles: ["木製チェア 北欧風"] }, mk("x", { title: "木製チェア 北欧風" }), "pick", "いま買える出品"],
   ];
   for (const [why, hist, item, kind, text] of cases) {
     const got = recommend(input({ items: [item], ...hist }), 4);
@@ -192,7 +216,7 @@ test("白・灰・黒は「箱庭にない色」にしない。文字の札（la
 });
 
 test("急がせる文言・偽の残り個数は作らない（理由の文言はすべて決まった形）", () => {
-  const allowed = /^(箱庭にない色|あと\d+個で進化|.+集め中|前に見た商品に近い|予算内|新着|まずはここから)$/;
+  const allowed = /^(箱庭にない色|あと\d+個で進化|.+集め中|前に見た商品に近い|予算内|新着|まずはここから|いま買える出品)$/;
   const items = Array.from({ length: 12 }, (_, i) =>
     mk(`i${i}`, { title: ["文庫", "ランプ", "スニーカー", "マグ"][i % 4] + i, price: 300 * (i + 1), figure: fig(["#3a8fe8", "#e8473b", "#2e9e4f"][i % 3]), created_at: i % 2 ? FRESH : OLD }),
   );
@@ -221,6 +245,28 @@ test("履歴なし：全部「まずはここから」で、新着＋模型あ�
   assert.equal(got[0].item.id, "best");
   assert.ok(got.every((r) => r.reason.kind === "starter" && r.reason.text === "まずはここから"));
   assert.ok(ids(got).indexOf("fig") < ids(got).indexOf("plain"));
+});
+
+test("履歴あり：どの商品にも「まずはここから」は付かない（購入1件で、どの理由にも当たらない商品でも）", () => {
+  // 実機テストの再現：¥2,000 の物を1つ買った人に、¥4,000・新着でない・カテゴリ不明・模型なしの商品
+  const items = [
+    mk("food", { title: "おいしいごはん", price: 4000, created_at: OLD }),
+    mk("new", { title: "傘", price: 500, created_at: FRESH }),
+  ];
+  const hists: Partial<RecInput>[] = [
+    { purchases: [mk("p", { title: "グラフ", price: 2000, status: "sold" })] },
+    { garden: [entry("g", "赤い箱", fig("#e8473b"))] },
+    { seenTitles: ["まったく別のもの"] },
+  ];
+  for (const h of hists) {
+    const got = recommend(input({ items, ...h }), 4);
+    assert.equal(got.length, 2);
+    assert.ok(got.every((r) => r.reason.kind !== "starter"), JSON.stringify(got.map((r) => r.reason)));
+  }
+  const got = recommend(input({ items, ...hists[0] }), 4);
+  assert.deepEqual(got.find((r) => r.item.id === "food")?.reason, { kind: "pick", text: "いま買える出品" });
+  // 履歴が無ければ、同じ商品は「まずはここから」のまま
+  assert.ok(recommend(input({ items }), 4).every((r) => r.reason.kind === "starter"));
 });
 
 test("検索0件のフォールバック：検索語に近い商品が上に来る", () => {

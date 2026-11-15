@@ -2,7 +2,23 @@
 // 実行：npm test（Node 24 の node:test）
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chatBuyable, initialOf, myCounts, mySections, previewText, relativeTime } from "../src/pages.ts";
+import {
+  SAMPLE_SELLER,
+  chatBuyable,
+  chatItemBadges,
+  initialOf,
+  markConvRead,
+  myCounts,
+  mySections,
+  nextCursor,
+  previewText,
+  relativeTime,
+  sellerName,
+  unreadBadge,
+  unreadLabel,
+  unreadOf,
+  unreadTotal,
+} from "../src/pages.ts";
 import type { Item, Purchase } from "../src/api.ts";
 
 const item = (id: string, over: Partial<Item> = {}): Item => ({
@@ -71,4 +87,85 @@ test("mySections / myCounts：出品中・購入・売れたに分け、件数�
   assert.equal(s.bought[0].price, 700); // 買ったときの価格
   assert.deepEqual(myCounts(s), { bought: 1, sold: 1, selling: 2 });
   assert.deepEqual(myCounts(mySections([], [])), { bought: 0, sold: 0, selling: 0 });
+});
+
+// ---- 2026-11 実機テストの修正 ----
+
+test("chatItemBadges：自分の商品は「あなたの出品」。売り切れなら「売り切れ」と両方。他人の物は買えるときだけ購入", () => {
+  const mine = { id: "me", display_name: "わたし" };
+  const cases: [string, Item, { buy: boolean; sold: boolean; own: boolean }][] = [
+    ["売れていない自分の商品", item("a", { seller: mine }), { buy: false, sold: false, own: true }],
+    ["売れた自分の商品", item("b", { seller: mine, status: "sold" }), { buy: false, sold: true, own: true }],
+    ["他人の売り切れ", item("c", { status: "sold" }), { buy: false, sold: true, own: false }],
+    ["購入できる商品", item("d"), { buy: true, sold: false, own: false }],
+    ["他人の非公開", item("e", { moderation_status: "hidden" }), { buy: false, sold: false, own: false }],
+  ];
+  for (const [why, it, want] of cases) assert.deepEqual(chatItemBadges(it, "me"), want, why);
+  // 自分の id が分からない（ログイン前）ときは「あなたの出品」にしない
+  assert.equal(chatItemBadges(item("f", { seller: mine }), "").own, false);
+});
+
+test("未読：開いている会話は0、無い・負は0。合計とバッジの文字（0は出さない、100以上は99+）", () => {
+  const convs = [
+    { id: "a", unread_count: 3 },
+    { id: "b", unread_count: 0 },
+    { id: "c" }, // unread_count が無い（古い応答）
+    { id: "d", unread_count: -1 },
+    { id: "e", unread_count: 2 },
+  ];
+  assert.equal(unreadOf(convs[0], ""), 3);
+  assert.equal(unreadOf(convs[0], "a"), 0, "開いている会話");
+  assert.equal(unreadOf(convs[2], ""), 0);
+  assert.equal(unreadOf(convs[3], ""), 0);
+  assert.equal(unreadTotal(convs, ""), 5);
+  assert.equal(unreadTotal(convs, "a"), 2);
+  assert.equal(unreadTotal([], ""), 0);
+  assert.equal(unreadBadge(0), "");
+  assert.equal(unreadBadge(-2), "");
+  assert.equal(unreadBadge(Number.NaN), "");
+  assert.equal(unreadBadge(1), "1");
+  assert.equal(unreadBadge(99), "99");
+  assert.equal(unreadBadge(100), "99+");
+  assert.equal(unreadLabel(0), "");
+  assert.equal(unreadLabel(4), "未読 4 件");
+});
+
+test("markConvRead：その会話だけ0にし、ほかは同じ物のまま", () => {
+  const convs = [
+    { id: "a", unread_count: 3 },
+    { id: "b", unread_count: 1 },
+  ];
+  const got = markConvRead(convs, "a");
+  assert.deepEqual(got, [
+    { id: "a", unread_count: 0 },
+    { id: "b", unread_count: 1 },
+  ]);
+  assert.equal(got[1], convs[1]);
+  assert.deepEqual(convs[0], { id: "a", unread_count: 3 }, "元の一覧は変えない");
+});
+
+test("sellerName：一覧と詳細で同じ（API の今の表示名。出品者なしは見本データ）", () => {
+  assert.equal(sellerName(item("a", { seller: { id: "s", display_name: "テスト1" } })), "テスト1");
+  assert.equal(sellerName(item("b", { seller: null })), SAMPLE_SELLER);
+  assert.equal(SAMPLE_SELLER, "（見本データ）");
+});
+
+// ---- メッセージの新着を取りに行く位置 ----
+
+test("取りに行く位置は、受け取った分の最大の ID まで進み、何も来なければそのまま", () => {
+  assert.equal(nextCursor("", []), "");
+  assert.equal(nextCursor("", [{ id: "01B" }, { id: "01C" }, { id: "01A" }]), "01C");
+  assert.equal(nextCursor("01C", []), "01C");
+  assert.equal(nextCursor("01C", [{ id: "01B" }]), "01C"); // 後戻りしない
+});
+
+test("送信の直前に相手が送ったメッセージを取りこぼさない（位置は自分の送信では進めない）", () => {
+  // 位置 01B のあと、相手が 01C を送り、自分が 01D を送った。次の取得は after=01B なので 01C も 01D も来る
+  let cursor = "01B";
+  const sentByMe = { id: "01D" };
+  void sentByMe; // 送信は画面に足すだけで、位置は変えない
+  const nextPoll = [{ id: "01C" }, { id: "01D" }].filter((m) => m.id > cursor);
+  assert.deepEqual(nextPoll.map((m) => m.id), ["01C", "01D"]);
+  cursor = nextCursor(cursor, nextPoll);
+  assert.equal(cursor, "01D");
 });

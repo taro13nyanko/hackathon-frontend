@@ -5,8 +5,9 @@ import { gardenLevel, type GardenEntry } from "./garden.ts";
 // 「あなたへのおすすめ」の決まり（画面を使わない部分）。広告ではなく、アプリ内で実際に売っている商品だけを並べ替える。
 // 有料で順位を上げる仕組み・偽の残り個数・急がせる文言は作らない。新しいテーブルも使わない（一覧・箱庭・購入履歴・端末の閲覧履歴だけ）。
 
-// similar は詳細ページの「この商品に近い」（detailRecs だけが付ける）
-export type RecReason = { kind: "color" | "level" | "category" | "seen" | "budget" | "new" | "starter" | "similar"; text: string };
+// similar は詳細ページの「この商品に近い」（detailRecs だけが付ける）。
+// pick は履歴のある人で、どの理由にも当たらなかった商品（「まずはここから」は履歴が無い人だけに使う）
+export type RecReason = { kind: "color" | "level" | "category" | "seen" | "budget" | "new" | "starter" | "similar" | "pick"; text: string };
 export type Rec = { item: Item; reason: RecReason };
 export type RecInput = {
   items: Item[]; // 通常一覧の商品（GET /items の結果）
@@ -135,12 +136,13 @@ export function nearQuery(query: string, it: Pick<Item, "title" | "description">
 }
 
 // ---- 除外：おすすめに出してよい商品か ----
-// 売り切れ・自分の出品・非公開・見本データ（出品者なし＝買えない）・指定された商品は出さない。
+// 公開中（moderation_status が ok）の出品だけ。売り切れ・自分の出品・確認中・非公開・見本データ（出品者なし＝買えない）・
+// 指定された商品は出さない（設計書 §2.1「確認中／非公開は出さない」。ホーム・検索0件・詳細・つぎはこれのすべてに効く）。
 export function isRecommendable(it: Item, viewerId: string | undefined, exclude: ReadonlySet<string>): boolean {
   if (it.status !== "on_sale") return false;
   if (it.seller === null) return false;
   if (viewerId !== undefined && it.seller.id === viewerId) return false;
-  if (it.moderation_status === "hidden") return false;
+  if (it.moderation_status !== "ok") return false;
   return !exclude.has(it.id);
 }
 
@@ -158,6 +160,8 @@ const isNewAt = (it: Item, now: Date) => {
 };
 
 export const STARTER: RecReason = { kind: "starter", text: "まずはここから" };
+// 履歴のある人で、どの理由にも当たらなかった商品の札（「まずはここから」は使わない）
+export const PICK: RecReason = { kind: "pick", text: "いま買える出品" };
 
 // 理由の強さが同じときの優先順（仕様の並び）
 const REASON_ORDER: RecReason["kind"][] = ["color", "level", "category", "seen", "budget", "new"];
@@ -255,29 +259,40 @@ function scoreAll(input: RecInput, cands: Item[]): Scored[] {
 
     score += hits.reduce((a, h) => a + h.pts, 0);
     hits.sort((a, b) => (Math.abs(a.pts - b.pts) > EPS ? b.pts - a.pts : REASON_ORDER.indexOf(a.kind) - REASON_ORDER.indexOf(b.kind)));
-    // 理由の札が1つも当たらない商品は「まずはここから」にする
-    const reason: RecReason = hits.length ? { kind: hits[0].kind, text: hits[0].text } : STARTER;
+    // 理由の札が1つも当たらない商品は「いま買える出品」にする（履歴のある人に「まずはここから」は出さない）
+    const reason: RecReason = hits.length ? { kind: hits[0].kind, text: hits[0].text } : PICK;
     return { item: it, score, reason, category };
   });
 }
 
 // recommend はおすすめを最大 limit 件返す。同じカテゴリは limit の半分まで（カテゴリが分からない物は数えない）。
+// ただし上限は目安：それで limit 件に届かなければ、上限で飛ばした商品を点数の順に足して埋める
+// （候補があるのに件数が減らないように。足りないのは、出せる候補そのものが少ないときだけ）。
 export function recommend(input: RecInput, limit: number): Rec[] {
   if (limit <= 0) return [];
   const cap = Math.max(1, Math.floor(limit / 2));
   const scored = scoreAll(input, candidatesOf(input)).sort(byScore);
   const perCategory = new Map<string, number>();
-  const out: Rec[] = [];
+  const picked: Scored[] = [];
+  const skipped: Scored[] = [];
   for (const s of scored) {
-    if (out.length >= limit) break;
+    if (picked.length >= limit) break;
     if (s.category !== null) {
       const n = perCategory.get(s.category) ?? 0;
-      if (n >= cap) continue;
+      if (n >= cap) {
+        skipped.push(s);
+        continue;
+      }
       perCategory.set(s.category, n + 1);
     }
-    out.push({ item: s.item, reason: s.reason });
+    picked.push(s);
   }
-  return out;
+  for (const s of skipped) {
+    if (picked.length >= limit) break;
+    picked.push(s);
+  }
+  // 埋めた分も含めて点数の順に並べ直す（上限のために後ろへ回した商品が、点数の低い物の下にならないように）
+  return picked.sort(byScore).map((s) => ({ item: s.item, reason: s.reason }));
 }
 
 // similarTo は詳細ページの「類似商品」。同じカテゴリ・近いタイトルが上。似ていない物は出さない（数合わせをしない）。
