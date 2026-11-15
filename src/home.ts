@@ -10,9 +10,10 @@ export type GardenData = {
   missing: Item[]; // 模型がまだの物
   purchases: Item[]; // 購入履歴（おすすめに渡す。新しい順のまま）
   items: Record<string, Item>; // id → 商品（フィギュア一覧のサムネに使う）
+  tags: Record<string, GardenTag>; // id → 売った／買った／出品中（模型の有無にかかわらず。箱庭のカウンターに使う）
 };
 
-export const EMPTY_GARDEN: GardenData = { entries: [], missing: [], purchases: [], items: {} };
+export const EMPTY_GARDEN: GardenData = { entries: [], missing: [], purchases: [], items: {}, tags: {} };
 
 // buildGarden は GET /me/items・/me/purchases・/me/garden の結果を箱庭の並びにする。
 // seen は前に箱庭を開いたときに見た模型（null は初めて：全部を NEW にはしない）。
@@ -27,14 +28,41 @@ export function buildGarden(mine: Item[], bought: Purchase[], spots: GardenSpot[
   const entries: GardenEntry[] = [];
   const missing: Item[] = [];
   const items: Record<string, Item> = {};
+  const tags: Record<string, GardenTag> = {};
   for (const { it, tag, at, price } of all) {
     if (items[it.id]) continue;
     items[it.id] = it;
+    tags[it.id] = tag;
     if (it.figure)
       entries.push({ id: it.id, title: it.title, figure: it.figure, tag, at, price, isNew: seen !== null && !seen.has(it.id), spot: spotOf.get(it.id) });
     else missing.push(it);
   }
-  return { entries, missing, purchases: bought.map((p) => p.item), items };
+  return { entries, missing, purchases: bought.map((p) => p.item), items, tags };
+}
+
+// 箱庭のカウンター「売った物・買った物・出品中」。模型の有無にかかわらず数える（マイページの件数と同じ数になる）。
+// models は、そのうち模型があって箱庭に並んでいる数
+export type GardenCounts = Record<GardenTag, number> & { models: number };
+export function gardenCounts(data: Pick<GardenData, "entries" | "tags">): GardenCounts {
+  const c: GardenCounts = { sold: 0, bought: 0, selling: 0, models: data.entries.length };
+  for (const tag of Object.values(data.tags)) c[tag] += 1;
+  return c;
+}
+
+// 模型をつくれる物：写真があって、非公開でない物。
+// 非公開（hidden）は /me/items には入るが、詳細に模型の欄が出ず保存も 404 になるので、つくれない
+export function canMakeFigure(it: Pick<Item, "photo_image_id" | "moderation_status">): boolean {
+  return it.photo_image_id !== "" && it.moderation_status !== "hidden";
+}
+
+// 模型がまだの物のうち、模型をつくれる物（「つくると箱庭に並ぶ」の導線に使う）
+export function makeable(missing: Item[]): Item[] {
+  return missing.filter(canMakeFigure);
+}
+
+// 箱庭の「模型がまだ N 件」チップ（つくれる物が無ければ出さない ""）
+export function makeableText(n: number): string {
+  return n > 0 ? `模型がまだ ${n} 件 → つくると箱庭に並びます` : "";
 }
 
 // ---- レベルカード：％はバーの幅と同じ数から出す（表示がずれないように） ----
@@ -102,6 +130,14 @@ export function recSubText(kinds: string[]): string {
   return kinds.length > 0 && kinds.every((k) => k === "starter") ? REC_SUB_STARTER : REC_SUB;
 }
 
+// おすすめが limit 件に満たないときの一言（recommend は候補を使い切ってから足りないので、理由は「候補が少ない」だけ）。
+// 足りていれば ""（何も出さない）
+export function recShortText(shown: number, limit: number): string {
+  if (shown >= limit) return "";
+  const why = "（買えない物＝売り切れ・確認中・自分の出品・見本データは出しません）";
+  return shown === 0 ? `いま買える、ほかの人の出品がありません${why}` : `いま買える、ほかの人の出品はこの${shown}件だけです${why}`;
+}
+
 // ---- 買う流れ（商品詳細・購入確認・購入完了） ----
 
 // 詳細の「あと{toNext}個で進化」チップ。次のレベルが無い（いちばん大きな島）なら出さない（""）
@@ -121,6 +157,19 @@ export function confirmChipText(item: Pick<Item, "figure" | "photo_image_id">): 
 export function countAfterBuy(entries: Pick<GardenEntry, "id">[], item: Pick<Item, "id" | "figure">): number {
   if (!item.figure || entries.some((e) => e.id === item.id)) return entries.length;
   return entries.length + 1;
+}
+
+// 購入完了の左のカード。模型があれば「箱庭に仲間入り！」、写真があれば模型づくりへのボタン（make）、
+// どちらも無ければ買った商品だけ。模型は商品に1つで、つくると出品者の箱庭（売った物）にも並ぶ
+export function boughtGarden(item: Pick<Item, "figure" | "photo_image_id">): { title: string; note: string; make: boolean } {
+  if (item.figure) return { title: "✨ 箱庭に仲間入り！", note: "模型がホームの箱庭に並びます。", make: false };
+  if (item.photo_image_id)
+    return {
+      title: "🌱 模型をつくると箱庭に並びます",
+      note: "この商品はまだ模型がありません。写真から模型をつくって保存すると、あなたの箱庭（買った物）と出品者の箱庭（売った物）の両方に並びます。",
+      make: true,
+    };
+  return { title: "買った商品", note: "この商品は写真が無いので、模型はつくれません（箱庭には並びませんが、マイページの「購入した商品」には入っています）。", make: false };
 }
 
 // 詳細ページのおすすめ帯の補足。「この商品に近い」（similar）と、箱庭・購入履歴からの理由、
