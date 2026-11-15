@@ -1,26 +1,34 @@
+import {
+  ADMIN_MESSAGES,
+  ApiError,
+  ASK_MESSAGES,
+  codeOf,
+  createItemError,
+  ITEM_RULES,
+  LIKE_MESSAGES,
+  toApiError,
+  VOICE_MESSAGES,
+} from "./apiErrors";
 import { auth } from "./firebase";
+import type { LikeState } from "./likes";
+import type { ModerationStatus } from "./moderation";
+import { itemsQuery, NO_RANGE, type PriceRange } from "./search";
+import type { VoiceMime } from "./voice";
 
 // バックエンド(Cloud Run)のURL。Vercel の「Environment Variables」に VITE_API_URL を設定する。
 // 例: https://hackathon-backend-xxxxxxxx-uc.a.run.app （末尾の / は不要）
 const API_URL = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
-export class ApiError extends Error {
-  status: number;
-  code: string;
-  constructor(message: string, status: number, code: string) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
+// エラーの型と「エラーコード → 日本語」の表は apiErrors.ts（通信をしないのでテストできる）
+export { ApiError, ProhibitedError, ITEM_RULES, MODERATION_NOTE_MAX, QUESTION_MAX } from "./apiErrors";
+
+// readBody は応答本文を JSON として読む（読めなければ null）。
+async function readBody(res: Response): Promise<unknown> {
+  return res.json().catch(() => null);
 }
 
 async function errorCode(res: Response): Promise<string> {
-  try {
-    const data: { error?: string } = await res.json();
-    return data.error ?? "";
-  } catch {
-    return "";
-  }
+  return codeOf(await readBody(res));
 }
 
 // authFetch はログイン中なら Authorization: Bearer <ID トークン> を付けて送る。
@@ -35,7 +43,20 @@ async function authFetch(path: string, init: RequestInit = {}): Promise<Response
   return fetch(`${API_URL}${path}`, { ...init, headers });
 }
 
-export type Member = { id: string; display_name: string };
+// optionalHeaders はログイン中なら Authorization を付ける（していなければ何も付けない）。
+// 一覧・詳細はログイン不要だが、付けると「自分がいいね済みか」と、出品者・管理者向けの理由が返る。
+async function optionalHeaders(): Promise<HeadersInit> {
+  const user = auth.currentUser;
+  if (!user) return {};
+  try {
+    return { Authorization: `Bearer ${await user.getIdToken()}` };
+  } catch {
+    return {}; // トークンが取れなくても、未ログインとして見せる
+  }
+}
+
+export type Role = "member" | "admin";
+export type Member = { id: string; display_name: string; role?: Role }; // role は GET/POST /me だけが返す
 export const DISPLAY_NAME_MAX = 50; // バックエンドの usecase/member.go と同じ
 
 // getMe は自分のプロフィール。まだ表示名を登録していなければ null。
@@ -68,6 +89,10 @@ export type Item = {
   figure_caption: string;
   figure: Figure | null; // 保存された 3D 模型の設計図（無ければ null）。箱庭に並ぶ
   created_at: string; // ISO 8601
+  like_count: number;
+  liked: boolean; // ログイン中の本人がいいね済みか（未ログインなら false）
+  moderation_status: ModerationStatus; // ok／review（確認中）／hidden（非公開）
+  moderation_reason: string; // 出品者本人と管理者にだけ入る。ほかの人には ""
 };
 export type ItemInput = { title: string; description: string; price: number; photo_image_id?: string };
 
@@ -106,38 +131,90 @@ export async function uploadImage(blob: Blob): Promise<string> {
   return ((await res.json()) as { id: string }).id;
 }
 
-// 出品の決まり（バックエンドの usecase/item.go と同じ値にしておく）
-export const ITEM_RULES = { titleMax: 40, descriptionMax: 1000, priceMin: 300, priceMax: 9_999_999 };
-
-export async function listItems(keyword = ""): Promise<Item[]> {
-  const q = keyword.trim() ? `?q=${encodeURIComponent(keyword.trim())}` : "";
-  const res = await fetch(`${API_URL}/items${q}`);
+// listItems は一覧・検索。range の 0 は指定なし。
+export async function listItems(keyword = "", range: PriceRange = NO_RANGE): Promise<Item[]> {
+  const res = await fetch(`${API_URL}/items${itemsQuery(keyword, range)}`, { headers: await optionalHeaders() });
+  if (res.status === 400) throw new Error("価格の範囲が正しくありません");
   if (!res.ok) throw new Error(`商品一覧の取得に失敗しました (HTTP ${res.status})`);
   return res.json();
 }
 
 export async function getItem(id: string): Promise<Item> {
-  const res = await fetch(`${API_URL}/items/${encodeURIComponent(id)}`);
+  const res = await fetch(`${API_URL}/items/${encodeURIComponent(id)}`, { headers: await optionalHeaders() });
   if (res.status === 404) throw new Error("この商品は見つかりませんでした");
   if (!res.ok) throw new Error(`商品の取得に失敗しました (HTTP ${res.status})`);
   return res.json();
 }
 
-// createItem は出品する（ログイン＋表示名の登録が必要）。
-export async function createItem(input: ItemInput): Promise<string> {
+export type CreatedItem = { id: string; moderation_status: ModerationStatus; moderation_reason: string };
+
+// createItem は出品する（ログイン＋表示名の登録が必要）。保存の前に AI が出品内容を確かめる。
+export async function createItem(input: ItemInput): Promise<CreatedItem> {
   const res = await authFetch("/items", { method: "POST", body: JSON.stringify(input) });
-  if (res.status === 400) {
-    const r = ITEM_RULES;
-    throw new Error(
-      `商品名は1〜${r.titleMax}文字、説明は${r.descriptionMax}文字まで、価格は${r.priceMin.toLocaleString()}〜${r.priceMax.toLocaleString()}円で入力してください`,
-    );
+  if (!res.ok) throw createItemError(res.status, await readBody(res));
+  return res.json();
+}
+
+// ---- いいね ----
+
+// setLike はいいねする（liked=true）／外す（false）。何度送っても同じ結果になる。
+export async function setLike(itemId: string, liked: boolean): Promise<LikeState> {
+  const res = await authFetch(`/items/${encodeURIComponent(itemId)}/like`, { method: liked ? "PUT" : "DELETE" });
+  if (res.ok) return res.json();
+  throw toApiError(res.status, await errorCode(res), LIKE_MESSAGES, "いいねできませんでした");
+}
+
+export async function listMyLikes(): Promise<Item[]> {
+  const res = await authFetch("/me/likes");
+  if (!res.ok) throw new ApiError(`いいねした商品の取得に失敗しました (HTTP ${res.status})`, res.status, await errorCode(res));
+  return res.json();
+}
+
+// ---- 音声検索（録音 → Gemini が検索条件に直す） ----
+
+export type VoiceSearchResult = { transcript: string; q: string; min_price: number; max_price: number };
+
+export async function voiceSearch(audio: Blob, mime: VoiceMime): Promise<VoiceSearchResult> {
+  const res = await authFetch("/search/voice", { method: "POST", body: JSON.stringify({ audio: await blobToBase64(audio), mime }) });
+  if (res.ok) return res.json();
+  throw toApiError(res.status, await errorCode(res), VOICE_MESSAGES, "音声検索に失敗しました");
+}
+
+// ---- 商品への質問（商品の情報とアプリの決まりだけを根拠に、AI が答える） ----
+
+export type AskSource = { id: number; kind: string; title: string; text: string };
+export type AskAnswer = { answer: string; sources: AskSource[]; grounded: boolean };
+
+export async function askItem(itemId: string, question: string): Promise<AskAnswer> {
+  const res = await authFetch(`/items/${encodeURIComponent(itemId)}/ask`, { method: "POST", body: JSON.stringify({ question }) });
+  if (res.ok) {
+    const data: AskAnswer = await res.json();
+    return { ...data, sources: data.sources ?? [] };
   }
-  if (res.status === 401) throw new ApiError("ログインし直してください", 401, "unauthorized");
-  if (res.status === 403) throw new ApiError("表示名を登録してから出品してください", 403, "profile_required");
-  if (res.status === 429) throw new ApiError("出品が続きすぎです。1分ほど待ってから、もう一度お試しください（1分に10件まで）", 429, "too_many");
-  if (!res.ok) throw new Error(`出品に失敗しました (HTTP ${res.status})`);
-  const data: { id: string } = await res.json();
-  return data.id;
+  throw toApiError(res.status, await errorCode(res), ASK_MESSAGES, "質問に失敗しました");
+}
+
+// ---- 管理者（出品の確認） ----
+
+async function adminError(res: Response, fallback: string): Promise<ApiError> {
+  return toApiError(res.status, await errorCode(res), ADMIN_MESSAGES, fallback);
+}
+
+// listAdminItems は要確認（review）か非公開（hidden）の商品を新しい順に返す（100件まで）。
+export async function listAdminItems(status: "review" | "hidden"): Promise<Item[]> {
+  const res = await authFetch(`/admin/items?status=${status}`);
+  if (!res.ok) throw await adminError(res, "確認する商品を読めませんでした");
+  return res.json();
+}
+
+// moderateItem は公開（ok）か非公開（hidden）にする。note があれば理由をそれで上書きする。
+export async function moderateItem(itemId: string, status: "ok" | "hidden", note = ""): Promise<Item> {
+  const res = await authFetch(`/admin/items/${encodeURIComponent(itemId)}/moderation`, {
+    method: "PUT",
+    body: JSON.stringify(note.trim() ? { status, note: note.trim() } : { status }),
+  });
+  if (!res.ok) throw await adminError(res, "更新できませんでした");
+  return res.json();
 }
 
 // ---- Gemini（説明文の下書き） ----

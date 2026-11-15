@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import {
   API_URL,
   DISPLAY_NAME_MAX,
@@ -23,13 +23,29 @@ import {
   startConversation,
   MESSAGE_MAX,
   NOTES_MAX,
+  QUESTION_MAX,
+  MODERATION_NOTE_MAX,
+  ProhibitedError,
+  askItem,
+  listAdminItems,
+  listMyLikes,
+  moderateItem,
+  setLike,
+  voiceSearch,
+  type AskAnswer,
+  type VoiceSearchResult,
   type Conversation,
   type Figure,
   type Item,
   type Message,
   type Purchase,
 } from "./api";
+import { splitAnswer, sourceKindText } from "./answer";
 import { useAuth } from "./auth";
+import { patchLike, toggleLike, type LikeState } from "./likes";
+import { categoryLabels, moderationNote } from "./moderation";
+import { NO_RANGE, priceRangeLabel, type PriceRange } from "./search";
+import { VOICE_MAX_BYTES, VOICE_MAX_MS, baseMime, micErrorMessage, pickRecordingMime } from "./voice";
 import ErrorBoundary from "./ErrorBoundary";
 import type { GardenHandle } from "./Garden3D";
 import {
@@ -53,19 +69,21 @@ const Garden3D = lazy(() => import("./Garden3D"));
 const yen = (n: number) => `¥${n.toLocaleString("ja-JP")}`;
 
 // 画面：一覧（list）／出品（sell）／詳細（detail）／購入確認（confirm）／購入完了（bought）／マイページ（mypage）
-//       ／メッセージ一覧（inbox）／メッセージ（chat）／箱庭（garden：売った物・買った物の模型を並べる）。
+//       ／メッセージ一覧（inbox）／メッセージ（chat）／箱庭（garden：売った物・買った物の模型を並べる）
+//       ／管理（admin：AI が「要確認」にした出品を管理者が見る。role が admin の人だけ）。
 // ログインして表示名が未登録のときは、どの画面よりも先にプロフィール登録を出す。
 // ページ遷移のライブラリ（React Router）はまだ入れていない。
 type View =
   | { kind: "list" }
   | { kind: "sell" }
-  | { kind: "detail"; id: string; from?: "garden" } // from：戻るボタンの行き先（無ければ一覧）
+  | { kind: "detail"; id: string; from?: "garden" | "admin" } // from：戻るボタンの行き先（無ければ一覧）
   | { kind: "confirm"; item: Item }
   | { kind: "bought"; item: Item }
   | { kind: "mypage" }
   | { kind: "inbox" }
   | { kind: "chat"; conv: Conversation }
-  | { kind: "garden" };
+  | { kind: "garden" }
+  | { kind: "admin" };
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "list" });
@@ -84,6 +102,11 @@ export default function App() {
           フリマ
         </button>
         <div className="header-right">
+          {state.status === "ready" && state.me.role === "admin" && (
+            <button className="ghost small" onClick={() => { setNotice(""); setView({ kind: "admin" }); }}>
+              管理
+            </button>
+          )}
           {state.status === "ready" && (
             <button className="ghost small" onClick={() => { setNotice(""); setView({ kind: "inbox" }); }}>
               メッセージ
@@ -126,8 +149,10 @@ export default function App() {
             {view.kind === "detail" && (
               <ItemDetail
                 id={view.id}
-                backLabel={view.from === "garden" ? "← 箱庭へ" : "← 一覧へ"}
-                onBack={() => (view.from === "garden" ? setView({ kind: "garden" }) : goList())}
+                backLabel={view.from === "garden" ? "← 箱庭へ" : view.from === "admin" ? "← 管理へ" : "← 一覧へ"}
+                onBack={() =>
+                  view.from === "garden" ? setView({ kind: "garden" }) : view.from === "admin" ? setView({ kind: "admin" }) : goList()
+                }
                 onBuy={(item) => setView({ kind: "confirm", item })}
                 onChat={(conv) => setView({ kind: "chat", conv })}
               />
@@ -158,6 +183,7 @@ export default function App() {
               <Garden onOpen={(id) => setView({ kind: "detail", id, from: "garden" })} onBack={() => setView({ kind: "mypage" })} />
             )}
             {view.kind === "inbox" && <Inbox onOpen={(conv) => setView({ kind: "chat", conv })} />}
+            {view.kind === "admin" && <AdminPage onOpen={(id) => setView({ kind: "detail", id, from: "admin" })} />}
             {view.kind === "chat" && (
               <Chat
                 conv={view.conv}
@@ -228,45 +254,100 @@ function ProfileForm({ email, onDone }: { email: string; onDone: (name: string) 
 
 // ---- 一覧 + キーワード検索 ----
 function ItemList({ onOpen }: { onOpen: (id: string) => void }) {
+  const { state } = useAuth();
   const [items, setItems] = useState<Item[] | null>(null);
   const [query, setQuery] = useState("");
+  const [range, setRange] = useState<PriceRange>(NO_RANGE); // 音声検索で決まった価格の範囲（札の × で解除）
+  const [heard, setHeard] = useState(""); // 音声検索で聞き取った文
+  const [voiceError, setVoiceError] = useState("");
+  const [hint, setHint] = useState(""); // いいねの案内・失敗
   const [error, setError] = useState("");
+  const applied = useRef<{ q: string; range: PriceRange }>({ q: "", range: NO_RANGE }); // 今の一覧の検索条件
+  const latest = useRef(0); // 続けて検索したとき、古い応答で上書きしない
 
-  async function load(keyword: string) {
+  async function load(keyword: string, r: PriceRange) {
+    applied.current = { q: keyword, range: r };
+    setHint(""); // 検索し直したら、いいねの案内は消す
+    const n = ++latest.current;
     setError("");
     try {
-      setItems(await listItems(keyword));
+      const got = await listItems(keyword, r);
+      if (n === latest.current) setItems(got);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (n === latest.current) setError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  // 画面を開いたときに全件を読み込む
+  // 開いたとき・ログイン状態が決まったときに読み込む（ログイン中なら「いいね済み」も付いて返る）
+  const authStatus = state.status;
   useEffect(() => {
-    listItems()
-      .then(setItems)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+    if (authStatus === "loading") return;
+    load(applied.current.q, applied.current.range);
+  }, [authStatus]);
 
   const onSearch = (e: FormEvent) => {
     e.preventDefault();
-    load(query);
+    setHeard("");
+    load(query, range);
   };
 
+  const onVoice = (r: VoiceSearchResult) => {
+    const next = { min: r.min_price, max: r.max_price };
+    setVoiceError("");
+    setQuery(r.q);
+    setRange(next);
+    setHeard(r.transcript);
+    load(r.q, next);
+  };
+
+  // 札の × は価格の範囲だけを外す。検索欄の、まだ送っていない文字では探さない
+  const clearRange = () => {
+    setRange(NO_RANGE);
+    load(applied.current.q, NO_RANGE);
+  };
+
+  // いいねの案内は、一覧の上ではなく画面の下に数秒だけ出す（下の方のカードを押しても見えるように）
+  useEffect(() => {
+    if (!hint) return;
+    const t = window.setTimeout(() => setHint(""), 4000);
+    return () => clearTimeout(t);
+  }, [hint]);
+
+  const rangeText = priceRangeLabel(range);
   return (
     <section>
       <form className="search" onSubmit={onSearch}>
         <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="何をお探しですか？（空欄で全件）" />
+        {state.status === "ready" && <VoiceSearchButton onResult={onVoice} onError={setVoiceError} />}
         <button>検索</button>
       </form>
+      {(rangeText || heard) && (
+        <div className="search-extra">
+          {heard && <span className="muted heard">『{heard}』で探しました</span>}
+          {rangeText && (
+            <span className="price-chip">
+              {rangeText}
+              <button type="button" onClick={clearRange} aria-label="価格の範囲を解除">
+                ×
+              </button>
+            </span>
+          )}
+        </div>
+      )}
+      {voiceError && <p className="err">{voiceError}</p>}
 
       {error && <p className="err">{error}</p>}
+      {hint && (
+        <p className="toast" role="status">
+          {hint}
+        </p>
+      )}
       {items === null && !error && <p className="muted">読み込み中…</p>}
       {items?.length === 0 && <p className="muted">商品が見つかりませんでした</p>}
 
       <ul className="grid">
         {items?.map((it) => (
-          <li key={it.id}>
+          <li key={it.id} className="card-wrap">
             <button className="card" onClick={() => onOpen(it.id)}>
               <Thumb item={it} />
               <div className="card-body">
@@ -274,11 +355,173 @@ function ItemList({ onOpen }: { onOpen: (id: string) => void }) {
                 <span className="price">{yen(it.price)}</span>
               </div>
               {it.status === "sold" && <span className="sold">SOLD</span>}
+              {it.moderation_status === "review" && <span className="review-mark">確認中</span>}
             </button>
+            <LikeButton
+              item={it}
+              className="on-card"
+              onChange={(s) => setItems((list) => (list ? patchLike(list, it.id, s) : list))}
+              onMessage={setHint}
+            />
           </li>
         ))}
       </ul>
     </section>
+  );
+}
+
+// ---- いいね（♡／♥ と数）。押した瞬間に見た目を変え、失敗したら元に戻す ----
+function LikeButton({
+  item,
+  className = "",
+  onChange,
+  onMessage,
+}: {
+  item: { id: string } & LikeState;
+  className?: string;
+  onChange: (s: LikeState) => void;
+  onMessage: (msg: string) => void;
+}) {
+  const { state } = useAuth();
+  const busy = useRef(false);
+
+  const onClick = async () => {
+    if (state.status !== "ready") {
+      onMessage("ログインするといいねできます");
+      return;
+    }
+    if (busy.current) return; // 送っている途中に押しても、二重に送らない
+    busy.current = true;
+    onMessage("");
+    // 先に見た目を変え、失敗したら押す前に戻す（流れは likes.ts の toggleLike でテスト済み）
+    try {
+      const msg = await toggleLike(item, (want) => setLike(item.id, want), onChange);
+      if (msg) onMessage(msg);
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className={`like ${item.liked ? "on" : ""} ${className}`}
+      aria-pressed={item.liked}
+      aria-label={item.liked ? "いいねを外す" : "いいね"}
+      onClick={onClick}
+    >
+      <span aria-hidden>{item.liked ? "♥" : "♡"}</span> {item.like_count}
+    </button>
+  );
+}
+
+// ---- 音声検索：押すと録音（最長15秒、もう一度押すと止める）→ Gemini が検索語と価格の範囲に直す ----
+function VoiceSearchButton({ onResult, onError }: { onResult: (r: VoiceSearchResult) => void; onError: (msg: string) => void }) {
+  // wait：マイクの許可を待っている間（ここで押し直しても2本目を始めない）
+  const [phase, setPhase] = useState<"" | "wait" | "rec" | "send">("");
+  const recorder = useRef<MediaRecorder | null>(null);
+  const timer = useRef(0);
+  const alive = useRef(true);
+
+  // 画面を離れたら録音を止め、マイクを放す（送信もしない）
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      clearTimeout(timer.current);
+      const r = recorder.current;
+      if (r && r.state !== "inactive") r.stop();
+    };
+  }, []);
+
+  async function start() {
+    onError("");
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      onError(micErrorMessage(""));
+      return;
+    }
+    setPhase("wait");
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      onError(micErrorMessage((e as { name?: string }).name ?? ""));
+      if (alive.current) setPhase("");
+      return;
+    }
+    const release = () => stream.getTracks().forEach((t) => t.stop());
+    if (!alive.current) {
+      release();
+      return;
+    }
+    const type = pickRecordingMime((t) => MediaRecorder.isTypeSupported(t));
+    let r: MediaRecorder;
+    try {
+      r = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    } catch {
+      release();
+      onError(micErrorMessage(""));
+      setPhase("");
+      return;
+    }
+    const chunks: Blob[] = [];
+    let stopTimer = 0; // この録音の15秒タイマー（録音ごとに持つ）
+    r.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+    r.onstop = async () => {
+      clearTimeout(stopTimer);
+      release();
+      recorder.current = null;
+      if (!alive.current) return;
+      const recorded = r.mimeType || type;
+      const mime = baseMime(recorded);
+      const blob = new Blob(chunks, { type: recorded });
+      if (!mime) {
+        onError("この端末の録音形式には対応していません。キーワードで検索してください");
+        setPhase("");
+        return;
+      }
+      if (blob.size === 0 || blob.size > VOICE_MAX_BYTES) {
+        onError(blob.size === 0 ? "録音できませんでした。もう一度お試しください" : "録音が長すぎます。短く話してください");
+        setPhase("");
+        return;
+      }
+      setPhase("send");
+      try {
+        const res = await voiceSearch(blob, mime);
+        if (alive.current) onResult(res);
+      } catch (e) {
+        if (alive.current) onError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (alive.current) setPhase("");
+      }
+    };
+    r.start();
+    recorder.current = r;
+    setPhase("rec");
+    stopTimer = window.setTimeout(() => {
+      if (r.state !== "inactive") r.stop();
+    }, VOICE_MAX_MS);
+    timer.current = stopTimer;
+  }
+
+  const onClick = () => {
+    if (phase === "rec") recorder.current?.stop();
+    else if (phase === "") start();
+  };
+
+  return (
+    <button
+      type="button"
+      className={`mic ${phase === "rec" ? "rec" : ""}`}
+      onClick={onClick}
+      disabled={phase === "send" || phase === "wait"}
+      aria-label={phase === "rec" ? "録音を止めて検索" : "声で探す"}
+      title={phase === "rec" ? "もう一度押すと止めて検索します（最長15秒）" : "声で探す（例：3000円以下の電卓）"}
+    >
+      {phase === "rec" ? "■ 止める" : phase === "send" ? "聞き取り中…" : phase === "wait" ? "準備中…" : "🎤"}
+    </button>
   );
 }
 
@@ -295,6 +538,8 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
   const [photo, setPhoto] = useState<{ id: string; preview: string } | null>(null);
   const [photoBusy, setPhotoBusy] = useState(false);
   const [photoError, setPhotoError] = useState("");
+  const [blocked, setBlocked] = useState<{ reason: string; categories: string[] } | null>(null); // AI の確認で止められた
+  const top = useRef<HTMLHeadingElement>(null);
 
   // 写真を選んだら、縮めてすぐ上げる（出品ボタンを押したときに待たせない）
   const onPhoto = async (file: File | undefined) => {
@@ -346,11 +591,19 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
     }
     setBusy(true);
     setError("");
+    setBlocked(null);
     try {
-      const id = await createItem({ title: title.trim(), description: description.trim(), price: p, photo_image_id: photo?.id });
-      onDone(id);
+      // 確認中（review）でも出品はされる。理由は詳細ページで出品者にだけ見える
+      const created = await createItem({ title: title.trim(), description: description.trim(), price: p, photo_image_id: photo?.id });
+      onDone(created.id);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (e instanceof ProhibitedError) {
+        // 入力はそのまま残し、理由をフォームの上に出す
+        setBlocked({ reason: e.reason, categories: e.categories });
+        top.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       setBusy(false);
     }
@@ -358,7 +611,23 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
 
   return (
     <section>
-      <h1>商品を出品</h1>
+      <h1 ref={top}>商品を出品</h1>
+      {blocked && (
+        <div className="prohibited" role="alert">
+          <b>この内容では出品できません</b>
+          {blocked.reason && <p>{blocked.reason}</p>}
+          {blocked.categories.length > 0 && (
+            <p className="chips">
+              {categoryLabels(blocked.categories).map((c) => (
+                <span key={c} className="badge sold-badge">
+                  {c}
+                </span>
+              ))}
+            </p>
+          )}
+          <small>写真・商品名・説明を AI が確認しています。入力はそのまま残してあるので、内容を直せばもう一度出品できます。</small>
+        </div>
+      )}
       <form className="sell" onSubmit={onSubmit}>
         <div className="photo-pick">
           <label className="photo-box">
@@ -424,7 +693,7 @@ function SellForm({ onDone, onCancel }: { onDone: (id: string) => void; onCancel
             やめる
           </button>
           <button className="primary" disabled={busy || photoBusy}>
-            {busy ? "出品中…" : "出品する"}
+            {busy ? "AI が出品内容を確認中…" : "出品する"}
           </button>
         </div>
       </form>
@@ -448,13 +717,24 @@ function ItemDetail({
 }) {
   const [item, setItem] = useState<Item | null>(null);
   const [error, setError] = useState("");
+  const [likeMsg, setLikeMsg] = useState("");
   const { state, login } = useAuth();
 
+  // ログイン状態が決まってから読む（ログイン中なら「いいね済み」と、出品者・管理者には確認の理由も返る）
+  const authStatus = state.status;
   useEffect(() => {
+    if (authStatus === "loading") return;
+    let stale = false;
     getItem(id)
-      .then(setItem)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, [id]);
+      .then((it) => !stale && setItem(it))
+      .catch((e) => !stale && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      stale = true;
+    };
+  }, [id, authStatus]);
+
+  const note = item ? moderationNote(item.moderation_status, item.moderation_reason) : null;
+  const hidden = item?.moderation_status === "hidden"; // 非公開：買う・メッセージ・質問はできない
 
   return (
     <section>
@@ -469,7 +749,7 @@ function ItemDetail({
           {item.figure_image_id && item.photo_image_id && (
             <img className="photo" src={imageUrl(item.photo_image_id)} alt={`${item.title}の写真`} loading="lazy" />
           )}
-          {(item.photo_image_id || item.figure) && (
+          {!hidden && (item.photo_image_id || item.figure) && (
             <FigureMaker
               item={item}
               myId={state.status === "ready" ? state.me.id : null}
@@ -477,14 +757,22 @@ function ItemDetail({
             />
           )}
           <h1>{item.title}</h1>
-          <p className="price big">{yen(item.price)}</p>
+          {note && <p className={`mod-note ${note.kind}`}>{note.text}</p>}
+          <div className="price-line">
+            <p className="price big">{yen(item.price)}</p>
+            {!hidden && (
+              <LikeButton item={item} onChange={(s) => setItem((it) => (it ? { ...it, ...s } : it))} onMessage={setLikeMsg} />
+            )}
+          </div>
+          {likeMsg && <p className="muted">{likeMsg}</p>}
           <p className="status">{item.status === "on_sale" ? "出品中" : "売り切れ"}</p>
           <p className="seller">出品者: {item.seller ? item.seller.display_name : "（見本データ）"}</p>
           <h2>商品の説明</h2>
           <p className="desc">{item.description || "（説明なし）"}</p>
           <p className="muted">出品日時: {new Date(item.created_at).toLocaleString("ja-JP")}</p>
+          {!hidden && <AskBox itemId={item.id} />}
           <div className="buy">
-            {item.status === "sold" ? (
+            {hidden ? null : item.status === "sold" ? (
               <button className="primary" disabled>
                 売り切れ
               </button>
@@ -499,13 +787,107 @@ function ItemDetail({
                 ログインして購入
               </button>
             ) : null}
-            {state.status === "ready" && item.seller && item.seller.id !== state.me.id && (
+            {!hidden && state.status === "ready" && item.seller && item.seller.id !== state.me.id && (
               <StartChatButton itemId={item.id} onChat={onChat} label="出品者にメッセージ" />
             )}
           </div>
         </article>
       )}
     </section>
+  );
+}
+
+// ---- この商品について質問する（商品の説明・出品者の他の商品・アプリの決まりから探し、その断片だけを根拠に AI が答える） ----
+function AskBox({ itemId }: { itemId: string }) {
+  const { state } = useAuth();
+  const [question, setQuestion] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<AskAnswer | null>(null);
+
+  if (state.status === "signedOut") return <p className="muted">ログインすると、この商品について AI に質問できます</p>;
+  if (state.status !== "ready") return null;
+
+  const onAsk = async (e: FormEvent) => {
+    e.preventDefault();
+    const q = question.trim();
+    if (!q) return;
+    setBusy(true);
+    setError("");
+    try {
+      setResult(await askItem(itemId, q));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const srcId = (n: number) => `ask-src-${itemId}-${n}`;
+  // [1] を押したら、下の根拠の一覧のその行へ
+  const jump = (e: MouseEvent, n: number) => {
+    e.preventDefault();
+    document.getElementById(srcId(n))?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
+
+  return (
+    <div className="ask">
+      <h2>この商品について質問する</h2>
+      <form className="ask-form" onSubmit={onAsk}>
+        <textarea
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          maxLength={QUESTION_MAX}
+          rows={2}
+          placeholder="例：受け渡しはどうすればいい？　書き込みはありますか？"
+        />
+        <div className="ask-actions">
+          <small className="muted">
+            {question.length}/{QUESTION_MAX}
+          </small>
+          <button className="ghost" disabled={busy || !question.trim()}>
+            {busy ? "AI が商品情報から調べています…" : "質問する"}
+          </button>
+        </div>
+      </form>
+      {error && <p className="err">{error}</p>}
+      {result && (
+        <div className="answer-box">
+          <p className="answer">
+            {splitAnswer(
+              result.answer,
+              result.sources.map((s) => s.id),
+            ).map((p, i) =>
+              p.kind === "text" ? (
+                <span key={i}>{p.text}</span>
+              ) : (
+                <sup key={i}>
+                  <a href={`#${srcId(p.id)}`} onClick={(e) => jump(e, p.id)}>
+                    [{p.id}]
+                  </a>
+                </sup>
+              ),
+            )}
+          </p>
+          {!result.grounded && <p className="muted">根拠が見つかりませんでした。出品者にメッセージで聞いてみてください。</p>}
+          {result.sources.length > 0 && (
+            <ol className="sources">
+              {result.sources.map((s) => (
+                <li key={s.id} id={srcId(s.id)}>
+                  <div className="source-head">
+                    <span className="src-no">[{s.id}]</span>
+                    <span className="badge">{sourceKindText(s.kind)}</span>
+                    <b>{s.title}</b>
+                  </div>
+                  <p>{s.text}</p>
+                </li>
+              ))}
+            </ol>
+          )}
+          <small className="muted">AI の答えは、商品の情報とアプリの決まりだけをもとにしています。大事なことは出品者に確かめてください。</small>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -694,12 +1076,14 @@ function Bought({
   );
 }
 
-// ---- マイページ（出品した商品・購入した商品） ----
+// ---- マイページ（出品した商品・購入した商品・いいねした商品） ----
 function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; onGarden: () => void; onLogout: () => void }) {
-  const [tab, setTab] = useState<"selling" | "bought">("selling");
+  const [tab, setTab] = useState<"selling" | "bought" | "likes">("selling");
   const [mine, setMine] = useState<Item[] | null>(null);
   const [bought, setBought] = useState<Purchase[] | null>(null);
+  const [likes, setLikes] = useState<Item[] | null>(null);
   const [error, setError] = useState("");
+  const [likesError, setLikesError] = useState("");
 
   useEffect(() => {
     Promise.all([listMyItems(), listMyPurchases()])
@@ -708,9 +1092,15 @@ function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; 
         setBought(b);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    // いいねは別に読む（読めなくても、出品・購入のタブは使える）
+    listMyLikes()
+      .then(setLikes)
+      .catch((e) => setLikesError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  const rows = tab === "selling" ? mine : bought?.map((p) => ({ ...p.item, price: p.price }));
+  const rows = tab === "selling" ? mine : tab === "likes" ? likes : (bought?.map((p) => ({ ...p.item, price: p.price })) ?? null);
+  const tabError = tab === "likes" ? likesError : error;
+  const empty = { selling: "まだ出品していません", bought: "まだ購入していません", likes: "まだいいねした商品はありません。商品の ♡ を押すと、ここに並びます" };
 
   return (
     <section>
@@ -730,16 +1120,23 @@ function MyPage({ onOpen, onGarden, onLogout }: { onOpen: (id: string) => void; 
         <button role="tab" aria-selected={tab === "bought"} className={tab === "bought" ? "on" : ""} onClick={() => setTab("bought")}>
           購入した商品{bought && `（${bought.length}）`}
         </button>
+        <button role="tab" aria-selected={tab === "likes"} className={tab === "likes" ? "on" : ""} onClick={() => setTab("likes")}>
+          いいね{likes && `（${likes.length}）`}
+        </button>
       </div>
-      {error && <p className="err">{error}</p>}
-      {rows === null && !error && <p className="muted">読み込み中…</p>}
-      {rows?.length === 0 && <p className="muted">{tab === "selling" ? "まだ出品していません" : "まだ購入していません"}</p>}
+      {tabError && <p className="err">{tabError}</p>}
+      {rows === null && !tabError && <p className="muted">読み込み中…</p>}
+      {rows?.length === 0 && <p className="muted">{empty[tab]}</p>}
       <ul className="rows">
         {rows?.map((it) => (
           <li key={it.id}>
             <button className="row" onClick={() => onOpen(it.id)}>
               <Thumb item={it} className="thumb small" />
-              <span className="title">{it.title}</span>
+              <span className="title">
+                {tab === "selling" && it.moderation_status === "review" && <span className="mod-tag">確認中</span>}
+                {tab === "selling" && it.moderation_status === "hidden" && <span className="mod-tag hidden">非公開</span>}
+                {it.title}
+              </span>
               <span className="price">{yen(it.price)}</span>
               {it.figure && <span className="badge figure-badge" title="模型あり">🧸</span>}
               {tab === "selling" && <span className={it.status === "sold" ? "badge sold-badge" : "badge"}>{it.status === "sold" ? "売れました" : "出品中"}</span>}
@@ -1164,6 +1561,102 @@ function Chat({ conv, onBack, onItem }: { conv: Conversation; onBack: () => void
           送信
         </button>
       </form>
+    </section>
+  );
+}
+
+// ---- 管理（AI が「要確認」にした出品・非公開にした出品を、管理者が見て決める） ----
+function AdminPage({ onOpen }: { onOpen: (id: string) => void }) {
+  const [tab, setTab] = useState<"review" | "hidden">("review");
+  const [items, setItems] = useState<Item[] | null>(null);
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [done, setDone] = useState("");
+
+  useEffect(() => {
+    let stale = false;
+    listAdminItems(tab)
+      .then((list) => !stale && setItems(list))
+      .catch((e) => !stale && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      stale = true;
+    };
+  }, [tab]);
+
+  // タブを替えたら読み直す（読み込み中の表示から）
+  const switchTab = (t: "review" | "hidden") => {
+    if (t === tab) return;
+    setTab(t);
+    setItems(null);
+    setError("");
+    setDone("");
+  };
+
+  async function decide(it: Item, status: "ok" | "hidden") {
+    setBusyId(it.id);
+    setError("");
+    setDone("");
+    try {
+      await moderateItem(it.id, status, notes[it.id] ?? "");
+      // 決めた商品はこのタブから外す（公開にしたら一覧に、非公開にしたら「非公開」タブに移る）
+      setItems((list) => list?.filter((x) => x.id !== it.id) ?? list);
+      setDone(`「${it.title}」を${status === "ok" ? "公開" : "非公開"}にしました`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  return (
+    <section>
+      <h1>管理</h1>
+      <p className="muted">AI が出品時に「迷う」と判断した商品です。内容を見て、問題なければ公開のまま、だめなら非公開にしてください。</p>
+      <div className="tabs" role="tablist">
+        <button role="tab" aria-selected={tab === "review"} className={tab === "review" ? "on" : ""} onClick={() => switchTab("review")}>
+          要確認{tab === "review" && items && `（${items.length}）`}
+        </button>
+        <button role="tab" aria-selected={tab === "hidden"} className={tab === "hidden" ? "on" : ""} onClick={() => switchTab("hidden")}>
+          非公開{tab === "hidden" && items && `（${items.length}）`}
+        </button>
+      </div>
+      {error && <p className="err">{error}</p>}
+      {done && <p className="ok">{done}</p>}
+      {items === null && !error && <p className="muted">読み込み中…</p>}
+      {items?.length === 0 && <p className="muted">{tab === "review" ? "確認待ちの商品はありません" : "非公開の商品はありません"}</p>}
+      <ul className="admin-rows">
+        {items?.map((it) => (
+          <li key={it.id} className="admin-row">
+            <button className="admin-thumb" onClick={() => onOpen(it.id)} title="商品ページを開く">
+              <Thumb item={it} className="thumb small" />
+            </button>
+            <div className="admin-main">
+              <button className="link" onClick={() => onOpen(it.id)}>
+                {it.title}
+              </button>
+              <span className="muted">
+                {yen(it.price)}・出品者: {it.seller ? it.seller.display_name : "（見本データ）"}
+              </span>
+              <p className="admin-reason">{it.moderation_reason || "（理由の記録なし）"}</p>
+              <input
+                value={notes[it.id] ?? ""}
+                onChange={(e) => setNotes({ ...notes, [it.id]: e.target.value })}
+                maxLength={MODERATION_NOTE_MAX}
+                placeholder={`メモ（任意、${MODERATION_NOTE_MAX}文字まで。入れると理由を書き換えます）`}
+              />
+              <div className="admin-actions">
+                <button className="ghost small" onClick={() => decide(it, "ok")} disabled={busyId !== ""}>
+                  問題なし（公開）
+                </button>
+                <button className="primary small" onClick={() => decide(it, "hidden")} disabled={busyId !== "" || tab === "hidden"}>
+                  非公開にする
+                </button>
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }
