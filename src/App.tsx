@@ -19,12 +19,14 @@ import {
   listMessages,
   sendMessage,
   markRead,
+  getPeerRead,
   getUnread,
   startConversation,
   MESSAGE_MAX,
   NOTES_MAX,
   QUESTION_MAX,
   MODERATION_NOTE_MAX,
+  ApiError,
   ProhibitedError,
   askItem,
   listAdminItems,
@@ -101,11 +103,13 @@ import {
   myCounts,
   mySections,
   nextCursor,
+  nextPeerRead,
   isReadable,
   previewText,
   readTarget,
   relativeTime,
   sellerName,
+  showReadMark,
   unreadBadge,
   unreadLabel,
   unreadOf,
@@ -2856,6 +2860,8 @@ function Chat({
   const [body, setBody] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 相手が読んだ位置（相手の既読。メッセージ ID）。自分のメッセージのうち、この位置以下のものに「既読」を出す
+  const [peerRead, setPeerRead] = useState("");
   const lastId = useRef("");
   const box = useRef<HTMLDivElement>(null);
   const bottom = useRef<HTMLDivElement>(null);
@@ -2886,6 +2892,18 @@ function Chat({
     // 失敗してもメッセージは使える（バッジが減らないだけ）
     let readUpTo = "";
     let pendingUpTo = "";
+    // 会話を切り替えたときは、Chat を key={conv.id} で作り直すので、既読の位置（peerRead）は "" から始まる（前の会話の位置を持ち越さない）
+    // 相手の既読の位置を読む（GET …/read）。新着が無くても相手が読めば変わるので、毎回読む。ただし画面が見えていないときは読まない。
+    // 失敗しても会話はそのまま使える（「既読」を出さないだけ）。古いバックエンドで無い（404・405・501）ときは、この会話ではもう読まない
+    let peerReadOff = false;
+    const loadPeerRead = () => {
+      if (peerReadOff || document.visibilityState !== "visible") return;
+      getPeerRead(conv.id)
+        .then((got) => !stopped && setPeerRead((cur) => nextPeerRead(cur, got)))
+        .catch((e) => {
+          if (e instanceof ApiError && [404, 405, 501].includes(e.status)) peerReadOff = true;
+        });
+    };
     const flush = () => {
       if (stopped) return;
       const target = readTarget(pendingUpTo, readUpTo, pageActive());
@@ -2905,6 +2923,7 @@ function Chat({
     document.addEventListener("keydown", flush);
     window.addEventListener("focus", flush);
     const tick = async () => {
+      loadPeerRead();
       try {
         const more = await listMessages(conv.id, lastId.current);
         if (stopped) return;
@@ -3007,7 +3026,15 @@ function Chat({
               )}
               <div className="msg-body">
                 <p className="bubble">{m.body}</p>
-                <span className="muted when">{relativeTime(m.created_at, now)}</span>
+                <span className="msg-meta">
+                  {/* LINE のように、相手が読んだ自分のメッセージに小さく「既読」 */}
+                  {me && showReadMark(m, myId, peerRead) && (
+                    <span className="muted read-mark">
+                      既読<span className="visually-hidden">（相手が読みました）</span>
+                    </span>
+                  )}
+                  <span className="muted when">{relativeTime(m.created_at, now)}</span>
+                </span>
               </div>
             </div>
           );

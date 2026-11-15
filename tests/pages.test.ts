@@ -13,6 +13,9 @@ import {
   nextCursor,
   previewText,
   isReadable,
+  isReadByPeer,
+  nextPeerRead,
+  showReadMark,
   readTarget,
   relativeTime,
   sellerName,
@@ -202,4 +205,39 @@ test("未読：見えていないときは、開いている会話もサーバ�
   ];
   assert.equal(unreadTotal(convs, "c1"), 1);
   assert.equal(unreadTotal(convs, "c1", false), 3);
+});
+
+// ---- 「既読」（相手が読んだ自分のメッセージ） ----
+// ULID は送った順に大きくなる文字列なので、文字列の大小で比べる
+const A = "01JD0000000000000000000001";
+const B = "01JD0000000000000000000002";
+const C = "01JD0000000000000000000003";
+
+test("isReadByPeer: 相手の既読の位置以下なら読んだ、より新しければまだ", () => {
+  assert.equal(isReadByPeer(A, B), true);
+  assert.equal(isReadByPeer(B, B), true); // ちょうどその位置も読んだ
+  assert.equal(isReadByPeer(C, B), false);
+});
+
+test("isReadByPeer: 位置が空（まだ読んでいない・取れなかった）なら何も読んでいない", () => {
+  assert.equal(isReadByPeer(A, ""), false);
+  assert.equal(isReadByPeer("", B), false);
+});
+
+test("showReadMark: 自分のメッセージで相手が読んだものだけ（相手のメッセージには出さない）", () => {
+  const mine = { id: A, sender_id: "me" };
+  const theirs = { id: A, sender_id: "you" };
+  assert.equal(showReadMark(mine, "me", B), true);
+  assert.equal(showReadMark(theirs, "me", B), false);
+  assert.equal(showReadMark({ id: C, sender_id: "me" }, "me", B), false);
+  assert.equal(showReadMark(mine, "", B), false); // 自分の ID がまだ無ければ出さない
+  assert.equal(showReadMark(mine, "me", ""), false);
+});
+
+test("nextPeerRead: 大きい方を残し、古い応答や空で後戻りしない", () => {
+  assert.equal(nextPeerRead("", A), A);
+  assert.equal(nextPeerRead(A, C), C);
+  assert.equal(nextPeerRead(C, B), C); // 遅れて届いた古い位置では戻らない
+  assert.equal(nextPeerRead(C, ""), C);
+  assert.equal(nextPeerRead("", ""), "");
 });

@@ -815,3 +815,8 @@ span.dm-icon { font-size: 1.2rem; }
 @media (max-width: 760px) {
   .garden-missing .make-go { grid-column: 2; justify-self: start; }
 }
+
+/* メッセージ：吹き出しの下の「既読」と時刻（自分の吹き出しは右寄せ。狭い幅でも1行に収める） */
+.msg-meta { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.msg.me .msg-meta { justify-content: flex-end; }
+.read-mark { font-size: 0.75rem; white-space: nowrap; }

@@ -331,6 +331,15 @@ export async function markRead(conversationId: string, lastMessageId = ""): Prom
   return typeof got.unread_count === "number" ? got.unread_count : 0;
 }
 
+// getPeerRead は、相手がこの会話をどこまで読んだか（相手の既読の位置。メッセージ ID）。まだ読んでいなければ ""。
+// 「既読」の表示に使う。失敗したら投げるので、呼ぶ側は会話の表示を止めずに「既読」を出さないだけにする
+export async function getPeerRead(conversationId: string): Promise<string> {
+  const res = await authFetch(`/conversations/${encodeURIComponent(conversationId)}/read`);
+  if (!res.ok) throw await dmError(res, "既読の位置の取得に失敗しました");
+  const got = (await res.json().catch(() => null)) as { peer_last_read_message_id?: unknown } | null;
+  return typeof got?.peer_last_read_message_id === "string" ? got.peer_last_read_message_id : "";
+}
+
 // getUnread は未読の合計（ナビの 💬 のバッジ）。
 export async function getUnread(): Promise<number> {
   const res = await authFetch("/me/unread");
