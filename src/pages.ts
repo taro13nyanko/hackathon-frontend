@@ -79,6 +79,23 @@ export function readTarget(pending: string, readUpTo: string, visible: boolean):
   return visible && pending !== "" && pending > readUpTo ? pending : null;
 }
 
+// ---- 「既読」（相手が読んだ自分のメッセージ） ----
+// peerLastRead は GET /conversations/{id}/read の peer_last_read_message_id（相手が読んだ最後のメッセージ ID。まだなら ""）。
+// ID は ULID（送った順に大きくなる）なので、その位置以下のメッセージは相手が読んだもの
+export function isReadByPeer(messageId: string, peerLastRead: string): boolean {
+  return messageId !== "" && peerLastRead !== "" && messageId <= peerLastRead;
+}
+
+// 「既読」を出すか：自分が送ったメッセージで、相手が読んだもの全部（LINE のように1通ずつ小さく出す）
+export function showReadMark(m: Pick<Message, "id" | "sender_id">, myId: string, peerLastRead: string): boolean {
+  return myId !== "" && m.sender_id === myId && isReadByPeer(m.id, peerLastRead);
+}
+
+// 相手の既読の位置を新しく受け取ったときの位置。大きい方を残す（遅れて届いた古い応答で後戻りしない）
+export function nextPeerRead(current: string, got: string): string {
+  return got > current ? got : current;
+}
+
 // バッジの文字。0 以下は ""（バッジを出さない）、100 以上は「99+」
 export function unreadBadge(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "";
