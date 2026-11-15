@@ -101,6 +101,7 @@ import {
   myCounts,
   mySections,
   nextCursor,
+  isReadable,
   previewText,
   readTarget,
   relativeTime,
@@ -156,17 +157,35 @@ type SearchState = { q: string; range: PriceRange; heard: string; n: number };
 
 const TIMES: TimeOfDay[] = ["morning", "day", "evening", "night"];
 
-// ---- 画面が見えているか（表示中で、しかもこのウィンドウにフォーカスがある）。既読にしてよいかの判定に使う ----
-// 2つのウィンドウを横に並べると両方とも visible になるので、フォーカスも見る
+// ---- 画面が見えているか（表示中で、このウィンドウにフォーカスがあるか、少し前にこのページを操作した）。既読にしてよいかの判定に使う ----
+// 2つのウィンドウを横に並べると両方とも visible になるので、フォーカスも見る。
+// ただし自動操作のブラウザなどでは、操作していてもフォーカスが来ないことがあるので、クリック・キー操作から TOUCH_ACTIVE_MS の間も見ている扱いにする。
+// 別のウィンドウへ移ったとき（blur）は操作の時刻を消す（並べた裏のウィンドウが既読にならないように）
+let lastTouch = 0; // このページを最後にクリック・キー操作した時刻（0＝まだ・または別のウィンドウへ移った）
+if (typeof window !== "undefined") {
+  const touch = () => {
+    if (document.visibilityState === "visible") lastTouch = Date.now();
+  };
+  document.addEventListener("pointerdown", touch, true);
+  document.addEventListener("keydown", touch, true);
+  window.addEventListener("blur", () => {
+    lastTouch = 0;
+  });
+}
 function pageActive(): boolean {
-  return typeof document !== "undefined" && document.visibilityState === "visible" && document.hasFocus();
+  if (typeof document === "undefined") return false;
+  return isReadable(document.visibilityState === "visible", document.hasFocus(), lastTouch === 0 ? Infinity : Date.now() - lastTouch);
 }
 function subscribePageActive(onChange: () => void): () => void {
   document.addEventListener("visibilitychange", onChange);
+  document.addEventListener("pointerdown", onChange);
+  document.addEventListener("keydown", onChange);
   window.addEventListener("focus", onChange);
   window.addEventListener("blur", onChange);
   return () => {
     document.removeEventListener("visibilitychange", onChange);
+    document.removeEventListener("pointerdown", onChange);
+    document.removeEventListener("keydown", onChange);
     window.removeEventListener("focus", onChange);
     window.removeEventListener("blur", onChange);
   };
@@ -189,8 +208,9 @@ async function fetchIsNewVersion(): Promise<boolean> {
     return false;
   }
 }
-// 再読込してはいけない画面（購入確認・出品の入力・チャットの最中。入力や確定の途中が消えるので）
-const NO_RELOAD_VIEWS = new Set<string>(["confirm", "sell", "chat"]);
+// 再読込してはいけない画面（購入確認・出品の入力・チャットの最中・商品詳細。入力や確定の途中、まだ保存していない3D模型や AI の答えが消えるので）。
+// この画面では「新しい版があります」も出さない（商品詳細では、スマホで固定の購入ボタンに重なるため）
+const NO_RELOAD_VIEWS = new Set<string>(["confirm", "sell", "chat", "detail"]);
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "list" });
@@ -268,6 +288,7 @@ export default function App() {
   // 新しい版の確かめ（ホーム・さがす・購入完了・マイページへ移るときに、VERSION_CHECK_INTERVAL_MS に1回まで）。
   // 新しい版があれば「新しい版があります」を出す。自動で再読込するのは、ホームへ移るとき（goHome）だけ
   const [updateReady, setUpdateReady] = useState(false);
+  const [updateClosed, setUpdateClosed] = useState(false); // お知らせを × で閉じた（閉じても、ホームへ移るときの再読込はする）
   const lastVersionCheck = useRef(0);
   useEffect(() => {
     if (!BOOT_BUNDLE || updateReady) return;
@@ -279,7 +300,7 @@ export default function App() {
   }, [viewKind, updateReady]);
 
   // あとから読む JS（3D 模型など）が古い版のため読めなかったとき：再読込してよい画面なら1回だけ再読込する。
-  // 購入確認・出品の入力・チャット中は再読込せず、「新しい版があります」を出すだけ
+  // 購入確認・出品の入力・チャット中・商品詳細は再読込せず、「新しい版があります」を出すだけ（出すのはその画面を離れてから）
   const viewKindRef = useRef(viewKind);
   useEffect(() => {
     viewKindRef.current = viewKind;
@@ -485,12 +506,15 @@ export default function App() {
             {hint}
           </p>
         )}
-        {/* 新しい版のお知らせ。購入確認・出品の入力・チャットの最中は出さない（押して途中が消えないように） */}
-        {updateReady && !hint && !NO_RELOAD_VIEWS.has(viewKind) && (
+        {/* 新しい版のお知らせ。購入確認・出品の入力・チャットの最中・商品詳細は出さない（押して途中が消えないように） */}
+        {updateReady && !updateClosed && !hint && !NO_RELOAD_VIEWS.has(viewKind) && (
           <p className="toast update-toast" role="status">
             新しい版があります
             <button type="button" className="update-reload" onClick={() => window.location.reload()}>
               再読込
+            </button>
+            <button type="button" className="update-close" aria-label="お知らせを閉じる" onClick={() => setUpdateClosed(true)}>
+              ×
             </button>
           </p>
         )}
@@ -2857,8 +2881,8 @@ function Chat({
     let stopped = false;
     let timer: number | undefined;
     // 既読：会話を開いて最初に読んだとき・新しいメッセージを画面に出したときに、画面に出した最後のメッセージまでを
-    // 既読にする（PUT …/read）。ただし画面が見えている（表示中でフォーカスもある）ときだけ。裏にある間は pendingUpTo に
-    // ためておき、見えるようになったら（visibilitychange・focus）送る。同じ位置は2回送らない（readTarget が readUpTo と比べる）。
+    // 既読にする（PUT …/read）。ただし画面が見えている（表示中で、フォーカスがあるか少し前に操作した）ときだけ。裏にある間は pendingUpTo に
+    // ためておき、見えるようになったら（visibilitychange・focus）か、ページをクリック・キー操作したら送る。同じ位置は2回送らない（readTarget が readUpTo と比べる）。
     // 失敗してもメッセージは使える（バッジが減らないだけ）
     let readUpTo = "";
     let pendingUpTo = "";
@@ -2875,7 +2899,10 @@ function Chat({
       if (lastShown > pendingUpTo) pendingUpTo = lastShown;
       flush();
     };
+    // クリック・キー操作は、lastTouch を更新したあと（バブリングの段階）で受ける
     document.addEventListener("visibilitychange", flush);
+    document.addEventListener("pointerdown", flush);
+    document.addEventListener("keydown", flush);
     window.addEventListener("focus", flush);
     const tick = async () => {
       try {
@@ -2898,6 +2925,8 @@ function Chat({
       stopped = true;
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", flush);
+      document.removeEventListener("pointerdown", flush);
+      document.removeEventListener("keydown", flush);
       window.removeEventListener("focus", flush);
     };
   }, [conv.id]);

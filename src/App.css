@@ -229,6 +229,7 @@ img.thumb.small { height: 48px; }
 /* 新しい版のお知らせ（「再読込」ボタンつき） */
 .update-toast { display: flex; align-items: center; gap: 12px; }
 .update-toast .update-reload { padding: 4px 12px; border-radius: var(--pill); background: #fff; color: var(--heading); font-weight: 800; }
+.update-toast .update-close { padding: 4px 8px; background: none; color: #fff; font-size: 1.1rem; line-height: 1; }
 
 /* 商品への質問（AI） */
 .ask { margin: 16px 0; }

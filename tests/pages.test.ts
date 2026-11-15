@@ -12,6 +12,7 @@ import {
   mySections,
   nextCursor,
   previewText,
+  isReadable,
   readTarget,
   relativeTime,
   sellerName,
@@ -179,6 +180,15 @@ test("既読にする位置：見えていて先に進んだときだけ。裏�
   assert.equal(readTarget("01A", "01B", true), null, "後戻りしない");
   assert.equal(readTarget("01B", "01B", true), null, "同じ位置は2回送らない（focus と visibilitychange が重なっても）");
   assert.equal(readTarget("", "", true), null, "まだ何も出していない");
+});
+
+test("既読にしてよいか：見えていて、フォーカスがあるか少し前に操作したときだけ", () => {
+  assert.equal(isReadable(true, true, Infinity), true, "フォーカスがある");
+  assert.equal(isReadable(true, false, 5_000), true, "フォーカスは無いが、5秒前にクリックした（自動操作のブラウザなど）");
+  assert.equal(isReadable(true, false, 60_000), false, "操作してから時間がたった");
+  assert.equal(isReadable(true, false, Infinity), false, "フォーカスも操作も無い（並べた裏のウィンドウ）");
+  assert.equal(isReadable(false, true, 0), false, "表示されていない（裏のタブ）");
+  assert.equal(isReadable(true, false, -1), false, "時刻が戻ったときは操作とみなさない");
 });
 
 test("未読：見えていないときは、開いている会話もサーバーの数を使う（既定は見えている扱いで前と同じ）", () => {
